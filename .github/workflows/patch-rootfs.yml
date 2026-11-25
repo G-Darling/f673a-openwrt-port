@@ -1,0 +1,127 @@
+name: Patch rootfs and rebuild JFFS2 (soft-float)
+
+# Fast path: takes the published soft-float rootfs.tar.gz, injects the
+# F673AV9a network bootstrap + root password, repacks and rebuilds JFFS2.
+# Runs in a couple of minutes instead of a full OpenWrt rebuild.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Release tag that contains *rootfs.tar.gz"
+        required: true
+        default: "softfloat-1"
+      root_password:
+        description: "root password for SSH/LuCI"
+        required: false
+        default: "f673a2026"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mtd-utils python3 python3-pip openssl
+
+      - name: Download base rootfs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.source_tag }}" \
+            -R "${GITHUB_REPOSITORY}" -p '*rootfs.tar.gz' -D .
+          ls -lh *.tar.gz
+
+      - name: Inject overlay + password
+        run: |
+          set -e
+          TAR=$(ls *rootfs.tar.gz | head -1)
+          rm -rf rf && mkdir rf
+          tar xzf "$TAR" -C rf
+          # overlay (network config bridging eth0..eth3, uci-defaults, ...)
+          if [ -d rootfs-overlay ]; then
+            cp -a rootfs-overlay/. rf/
+          fi
+          # root password from input
+          HASH=$(openssl passwd -1 -salt f673a '${{ inputs.root_password }}')
+          python3 - "$HASH" <<'PY'
+          import sys
+          h = sys.argv[1]
+          p = 'rf/etc/shadow'
+          line = 'root:%s:19000:0:99999:7:::\n' % h
+          lines = open(p, encoding='utf-8').read().splitlines(True)
+          out = [line if l.startswith('root:') else l for l in lines]
+          if not any(l.startswith('root:') for l in out):
+              out.insert(0, line)
+          open(p, 'w', encoding='utf-8').writelines(out)
+          print('shadow root line set')
+          PY
+          # make sure sshd allows password login
+          python3 - <<'PY'
+          import os
+          p = 'rf/etc/config/dropbear'
+          if not os.path.exists(p):
+              open(p, 'w').write("config dropbear\n\toption PasswordAuth 'on'\n\toption RootPasswordAuth 'on'\n\toption Port '22'\n")
+          else:
+              s = open(p).read()
+              if 'PasswordAuth' not in s:
+                  s += "\toption PasswordAuth 'on'\n\toption RootPasswordAuth 'on'\n"
+              open(p, 'w').write(s)
+          print('dropbear config ok')
+          PY
+          sudo chown -R root:root rf
+          sudo mkdir -p rf/dev && sudo mknod -m 622 rf/dev/console c 5 1 || true
+
+      - name: Build JFFS2
+        run: |
+          set -e
+          sudo mkfs.jffs2 -r rf -o openwrt-f673a.jffs2 \
+            -e 0x20000 -s 0x800 --no-cleanmarkers -q
+          ls -lh openwrt-f673a.jffs2
+          md5sum openwrt-f673a.jffs2
+          python3 -c "
+          import struct
+          d=open('openwrt-f673a.jffs2','rb').read()
+          print('magic', d[:2].hex(), 'size', len(d))
+          "
+          sudo tar czf rootfs-patched.tar.gz -C rf .
+
+      - name: Verify JFFS2 contents
+        run: |
+          pip install --quiet jefferson
+          rm -rf jf && python3 - <<'PY'
+          import os
+          from pathlib import Path
+          os.mknod = lambda *a, **k: None
+          os.makedev = lambda *a: 0
+          from jefferson.jffs2 import extract_jffs2
+          d = Path('jf'); d.mkdir(exist_ok=True)
+          extract_jffs2(Path('openwrt-f673a.jffs2').resolve(), d, 0)
+          for f in ['init', 'sbin/init', 'etc/shadow', 'etc/config/network', 'bin/busybox']:
+              p = Path('jf') / f
+              print('%-22s %s' % (f, 'OK' if p.exists() else 'MISSING'))
+          import struct
+          b = Path('jf/bin/busybox').read_bytes()[:40]
+          fl = struct.unpack_from('<I', b, 36)[0]
+          print('busybox ELF flags %#010x %s' % (fl, 'SOFT-OK' if not fl & 0x400 else 'HARD-FAIL'))
+          assert not fl & 0x400, 'hard-float!'
+          assert (Path('jf/init').exists() or Path('jf/sbin/init').exists())
+          PY
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="jffs2-sf-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" openwrt-f673a.jffs2 rootfs-patched.tar.gz \
+            -R "${GITHUB_REPOSITORY}" \
+            --title "F673AV9a soft-float rootfs + JFFS2 ($TAG)" \
+            --notes "Patched from ${{ inputs.source_tag }}: br-lan bridges eth0..eth3, static 192.168.1.1/24, root password set, dropbear password auth on. Flash JFFS2 at slot0+0x3C0000 (abs 0x1DC0000)."
+          echo "TAG=$TAG"
