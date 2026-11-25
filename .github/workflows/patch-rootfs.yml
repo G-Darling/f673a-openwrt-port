@@ -15,6 +15,10 @@ on:
         description: "root password for SSH/LuCI"
         required: false
         default: "f673a2026"
+      diag_init:
+        description: "Set true to replace /init with boot diagnostic (NAND log + telnetd)"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -78,6 +82,52 @@ jobs:
           PY
           sudo chown -R root:root rf
           sudo mkdir -p rf/dev && sudo mknod -m 622 rf/dev/console c 5 1 || true
+
+      - name: Install diagnostic init
+        if: ${{ inputs.diag_init == 'true' }}
+        run: |
+          set -e
+          if [ -f rf/init ]; then sudo cp -a rf/init rf/init.orig; else sudo cp -a rf/sbin/init rf/init.orig; fi
+          sudo tee rf/init > /dev/null <<'SH'
+          #!/bin/sh
+          # F673A diagnostic init: vendor kernel has no serial console, so we
+          # persist boot state to NAND and expose a shell over the LAN port.
+          PATH=/sbin:/bin:/usr/sbin:/usr/bin
+          export PATH
+          mount -t proc proc /proc 2>/dev/null
+          mount -t sysfs sysfs /sys 2>/dev/null
+          mount -t devtmpfs devtmpfs /dev 2>/dev/null
+          mkdir -p /tmp
+          L=/tmp/diag.txt
+          : > $L
+          echo "== DIAG INIT RAN ==" >> $L
+          cat /proc/version >> $L 2>&1
+          echo "-- cmdline --" >> $L
+          cat /proc/cmdline >> $L 2>&1
+          echo "-- mtd --" >> $L
+          cat /proc/mtd >> $L 2>&1
+          echo "-- mounts --" >> $L
+          cat /proc/mounts >> $L 2>&1
+          echo "-- dmesg tail --" >> $L
+          dmesg | tail -20 >> $L 2>&1
+          echo "-- dmesg key --" >> $L
+          dmesg | grep -iE 'jffs|mtd|panic|vfs|Unable|error|fail|eth[0-9]|watchdog' | tail -20 >> $L 2>&1
+          D=/dev/mtdblock11
+          [ -e $D ] || { mkdir -p /tmp/d; mknod /tmp/d/m11 b 31 11 2>/dev/null; D=/tmp/d/m11; }
+          if [ -e $D ]; then
+            dd if=$L of=$D bs=4096 seek=8192 count=1 conv=notrunc 2>/dev/null && echo "NAND-WRITE OK" >> $L
+          else
+            echo "NO-MTDBLOCK" >> $L
+          fi
+          sync
+          for d in eth0 eth1 eth2 eth3; do
+            ifconfig $d 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null
+          done
+          telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
+          sleep 1000000
+          SH
+          sudo chmod 755 rf/init
+          sudo head -3 rf/init
 
       - name: Build JFFS2
         run: |
