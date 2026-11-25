@@ -61,7 +61,7 @@ jobs:
       - name: Build
         working-directory: openwrt
         run: |
-          make -j$(nproc) IGNORE_ERRORS=n m -i || make -j1 V=s
+          make -j$(nproc) IGNORE_ERRORS=n || make -j1 V=s
 
       - name: Collect artifacts
         run: |
