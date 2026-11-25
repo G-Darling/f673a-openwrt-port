@@ -1,0 +1,4 @@
+#!/bin/sh
+# The kernel's built-in init search order is /sbin/init, /etc/init, /bin/init,
+# /bin/sh -- a bare /init is only used for initramfs, so hook it here.
+exec /init
