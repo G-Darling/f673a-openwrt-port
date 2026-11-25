@@ -88,6 +88,7 @@ jobs:
         run: |
           set -e
           if [ -f rf/init ]; then sudo cp -a rf/init rf/init.orig; else sudo cp -a rf/sbin/init rf/init.orig; fi
+          sudo cp -a rf/sbin/init rf/sbin/init.orig
           sudo tee rf/init > /dev/null <<'SH'
           #!/bin/sh
           # F673A diagnostic init: vendor kernel has no serial console, so we
@@ -108,6 +109,10 @@ jobs:
           cat /proc/mtd >> $L 2>&1
           echo "-- mounts --" >> $L
           cat /proc/mounts >> $L 2>&1
+          echo "-- rootfs id --" >> $L
+          ls / >> $L 2>&1
+          cat /etc/openwrt_release >> $L 2>&1
+          cat /etc/os-release >> $L 2>&1
           echo "-- dmesg tail --" >> $L
           dmesg | tail -20 >> $L 2>&1
           echo "-- dmesg key --" >> $L
@@ -127,6 +132,7 @@ jobs:
             ip addr add 192.168.1.1/24 dev $d 2>/dev/null
           done
           telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
+          telnetd -l /bin/sh -p 2323 >/dev/null 2>&1 &
           sleep 2
           {
             echo "-- net --"
@@ -139,7 +145,10 @@ jobs:
           sleep 1000000
           SH
           sudo chmod 755 rf/init
-          sudo head -3 rf/init
+          sudo rm -f rf/sbin/init
+          sudo cp -a rf/init rf/sbin/init
+          sudo chmod 755 rf/sbin/init
+          ls -l rf/init rf/sbin/init
 
       - name: Build JFFS2
         run: |
