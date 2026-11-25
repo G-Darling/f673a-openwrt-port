@@ -1,9 +1,11 @@
-/* diag-uart-init.c — freestanding ARM init that talks to PL011 directly.
+/* diag-uart-init.c — freestanding ARM init: direct PL011 + NAND stage markers.
  *
- * Why: the vendor 4.19 kernel has no working serial console (pl011 platform
- * driver fails to register, CONFIG_VFP=n). So we bypass the kernel console
- * entirely: write to the UART data register ourselves, and capture child
- * process output through a pipe.
+ * The vendor 4.19 kernel never prints (no usable serial console). Worse, its
+ * failed pl011 probe may leave the controller disabled, so a plain DR write
+ * produces nothing. Here we re-initialise the PL011 ourselves (reusing the
+ * baud divisors u-boot programmed) and, as an independent channel, write stage
+ * markers into a spare block of the rootfs MTD partition that we can read back
+ * from u-boot afterwards.
  *
  * Build:
  *   arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
@@ -13,8 +15,13 @@ typedef unsigned int u32;
 typedef unsigned long ulong;
 
 #define UART_BASE 0x94404000UL
-#define UART_DR   (*(volatile u32 *)(UART_BASE + 0x00))
-#define UART_FR   (*(volatile u32 *)(UART_BASE + 0x18))
+#define U_DR    (*(volatile u32 *)(UART_BASE + 0x00))
+#define U_FR    (*(volatile u32 *)(UART_BASE + 0x18))
+#define U_IBRD  (*(volatile u32 *)(UART_BASE + 0x24))
+#define U_FBRD  (*(volatile u32 *)(UART_BASE + 0x28))
+#define U_LCRH  (*(volatile u32 *)(UART_BASE + 0x2C))
+#define U_CR    (*(volatile u32 *)(UART_BASE + 0x30))
+#define U_ICR   (*(volatile u32 *)(UART_BASE + 0x44))
 
 /* ---- syscalls (ARM EABI, r7 = number) ---- */
 static inline long sc1(long n, long a) {
@@ -57,11 +64,44 @@ static long sys_mount(const char *s, const char *t, const char *f, ulong fl, con
     asm volatile("svc #0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r7) : "memory");
     return r0;
 }
+static long sys_mknodat(long dirfd, const char *path, long mode, long dev) {
+    register long r0 asm("r0") = dirfd;
+    register long r1 asm("r1") = (long)path;
+    register long r2 asm("r2") = mode;
+    register long r3 asm("r3") = dev;
+    register long r7 asm("r7") = 347;
+    asm volatile("svc #0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r3), "r"(r7) : "memory");
+    return r0;
+}
 
-/* ---- tiny UART console ---- */
+/* ---- string helpers (no libc) ---- */
+static int slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+static void s_copy(char *d, const char *s) { while (*s) *d++ = *s++; *d = 0; }
+static void s_cat(char *d, const char *s) { while (*d) d++; s_copy(d, s); }
+static void s_num(char *d, long v) {
+    char b[24]; int i = 0; ulong u;
+    if (v < 0) { *d++ = '-'; u = (ulong)(-v); } else u = (ulong)v;
+    if (!u) { *d++ = '0'; *d = 0; return; }
+    while (u) { b[i++] = (char)('0' + (u % 10)); u /= 10; }
+    while (i--) *d++ = b[i];
+    *d = 0;
+}
+
+/* ---- PL011: take it over explicitly ---- */
+static void uart_init(void) {
+    u32 ibrd = U_IBRD, fbrd = U_FBRD;
+    if (ibrd == 0 || ibrd > 0xffff) { ibrd = 13; fbrd = 1; }  /* 24MHz/115200 */
+    U_CR = 0;
+    U_ICR = 0x7ff;
+    U_IBRD = ibrd;
+    U_FBRD = fbrd;
+    U_LCRH = 0x70;          /* 8N1 + FIFO */
+    U_CR = 0x301;           /* UARTEN | TXE | RXE */
+}
 static void putc_(char c) {
-    while (UART_FR & (1u << 5)) { }
-    UART_DR = (u32)(unsigned char)c;
+    int spin = 0;
+    while ((U_FR & (1u << 5)) && spin < 1000000) spin++;
+    U_DR = (u32)(unsigned char)c;
 }
 static void puts_(const char *s) { while (*s) putc_(*s++); }
 static void putdec(long v) {
@@ -71,10 +111,33 @@ static void putdec(long v) {
     while (u) { b[i++] = (char)('0' + (u % 10)); u /= 10; }
     while (i--) putc_(b[i]);
 }
-static void puthex(ulong v) {
-    const char *h = "0123456789abcdef"; int i;
-    puts_("0x");
-    for (i = 15; i >= 0; i--) putc_(h[(v >> (i * 4)) & 0xf]);
+static void report(const char *label, long v) { puts_(label); putdec(v); puts_("\r\n"); }
+
+/* ---- NAND stage marker: /dev/mtdblock12 offset 0x1800000 (past rootfs) ---- */
+#define MARK_DEV "/dev/mtdblock12"
+#define MARK_OFF 0x1800000
+
+static void marker(const char *stage, long extra, int has_extra) {
+    char buf[256];
+    int i;
+    for (i = 0; i < 255; i++) buf[i] = 0;
+    s_copy(buf, "F673A-STAGE:");
+    s_cat(buf, stage);
+    if (has_extra) { s_cat(buf, " value="); s_num(buf + slen(buf), extra); }
+    s_cat(buf, "\n");
+    int n = slen(buf);
+
+    long fd = sc3(5, (long)MARK_DEV, 2 /*O_RDWR*/, 0);   /* open */
+    if (fd < 0) {
+        sys_mknodat(-100, MARK_DEV, 0060600, 0x1f0c);     /* b 31 12 */
+        fd = sc3(5, (long)MARK_DEV, 2, 0);
+    }
+    if (fd < 0) return;
+    /* lseek(fd, off, SEEK_SET) = 19 */
+    if (sc3(19, fd, MARK_OFF, 0) >= 0) {
+        sc3(4, fd, (long)buf, n);
+    }
+    sc1(6, fd);
 }
 
 /* ---- helpers ---- */
@@ -93,17 +156,13 @@ static void dump_file(const char *path, int max) {
     sc1(6, fd);
 }
 
-static void report(const char *label, long v) {
-    puts_(label); putdec(v); puts_("\r\n");
-}
-
 static void run_cmd(const char *cmd) {
     long p[2];
     if (sc2(42, (long)p, 0) < 0) { puts_("[run] pipe failed\r\n"); return; }
-    long pid = sc1(2, 0);            /* fork */
+    long pid = sc1(2, 0);
     if (pid == 0) {
-        sc2(63, p[1], 1);            /* dup2 stdout */
-        sc2(63, p[1], 2);            /* dup2 stderr */
+        sc2(63, p[1], 1);
+        sc2(63, p[1], 2);
         sc1(6, p[0]); sc1(6, p[1]);
         char *argv[] = { (char *)"/bin/busybox", (char *)"sh", (char *)"-c", (char *)cmd, 0 };
         char *envp[] = { (char *)"PATH=/sbin:/bin:/usr/sbin:/usr/bin", (char *)"HOME=/", 0 };
@@ -127,24 +186,29 @@ static void run_cmd(const char *cmd) {
 
 /* ---- entry ---- */
 void _start(void) {
+    /* 1. bring the UART back to life first (kernel may have left CR=0) */
+    uart_init();
     puts_("\r\n\r\n[UART-INIT] ALIVE\r\n");
+    marker("ENTRY", 0, 0);
 
-    sc2(39, (long)"/proc", 0555);    /* mkdir */
+    sc2(39, (long)"/proc", 0555);
     sc2(39, (long)"/sys", 0555);
     sc2(39, (long)"/dev", 0755);
     sc2(39, (long)"/tmp", 0777);
 
+    report("[UART-INIT] mount devtmpfs = ", sys_mount("devtmpfs", "/dev", "devtmpfs", 0, 0));
     report("[UART-INIT] mount proc = ", sys_mount("proc", "/proc", "proc", 0, 0));
     report("[UART-INIT] mount sysfs = ", sys_mount("sysfs", "/sys", "sysfs", 0, 0));
-    report("[UART-INIT] mount devtmpfs = ", sys_mount("devtmpfs", "/dev", "devtmpfs", 0, 0));
+    marker("MOUNTED", 0, 0);
 
     puts_("---- /proc/version ----\r\n");   dump_file("/proc/version", 400);
     puts_("---- /proc/cmdline ----\r\n");   dump_file("/proc/cmdline", 600);
     puts_("---- /proc/mtd ----\r\n");       dump_file("/proc/mtd", 2000);
     puts_("---- /proc/mounts ----\r\n");    dump_file("/proc/mounts", 1200);
+    puts_("---- /proc/partitions ----\r\n"); dump_file("/proc/partitions", 800);
     puts_("---- /etc/openwrt_release ----\r\n"); dump_file("/etc/openwrt_release", 600);
 
-    puts_("---- test: busybox echo ----\r\n");
+    puts_("---- test: busybox ----\r\n");
     run_cmd("echo BUSYBOX-OK; uname -a");
 
     puts_("---- test: busybox ls / ----\r\n");
@@ -153,6 +217,7 @@ void _start(void) {
     puts_("---- test: /dev/ttyAMA0 ----\r\n");
     report("[open /dev/ttyAMA0] fd = ", sc3(5, (long)"/dev/ttyAMA0", 1, 0));
 
+    marker("DONE", 0, 0);
     puts_("[UART-INIT] DONE\r\n");
     for (;;) { }
 }
