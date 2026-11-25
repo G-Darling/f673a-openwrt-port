@@ -4,14 +4,12 @@ config interface 'loopback'
 	option ipaddr '127.0.0.1'
 	option netmask '255.0.0.0'
 
-config globals 'globals'
-	option ula_prefix 'fd00:f673:a9a9::/48'
-
-# Vendor kernel 4.19 has NO bridge module built in and our rootfs only ships
-# 6.12 modules, so br-lan cannot be created. Bind the static address straight
-# onto eth0 (the port u-boot uses for TFTP, i.e. LAN1).
+# ZTE F673AV9a / ZX279128S: the vendor kernel exposes the LAN port as mii0
+# (see the factory /etc/sysconfig/network-scripts/ifcfg-mii0). There is no
+# bridge module and the vendor kernel OOPSes (then watchdog-resets the board)
+# if eth0 is ever opened, so the management address is bound straight to mii0.
 config interface 'lan'
-	option device 'eth0'
+	option device 'mii0'
 	option proto 'static'
 	option ipaddr '192.168.1.1'
 	option netmask '255.255.255.0'
