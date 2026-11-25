@@ -4,15 +4,19 @@
 # Why this exists: OpenWrt's normal /init -> preinit -> procd chain never gets
 # the board onto the network here, and the kernel has no usable console, so a
 # plain OpenWrt boot is silent and unreachable. This script does the minimum
-# needed to get an SSH shell:
-#   * mount the pseudo filesystems
-#   * remount / read-write (vendor bootargs use "ro")
-#   * put 192.168.1.1/24 on mii0 -- the LAN port. Never touch eth0: opening it
-#     kills the vendor kernel and the board then reboots in a loop.
-#   * start dropbear with -R so host keys are generated on the fly
+# needed to get a shell:
+#   * mount the pseudo filesystems and remount / read-write
+#   * try to make the debug UART usable and report progress on it (best effort)
+#   * bring up EVERY netdev that exists. The name is not stable: the vendor
+#     kernel calls the LAN port mii0, the OpenWrt kernel may call it eth0, so
+#     hard-coding mii0 leaves the port down and the PHY never links.
+#   * start dropbear plus telnetd (telnetd needs no host keys)
 #   * keep PID 1 alive forever (exiting would panic the kernel)
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+UART=""
 
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
@@ -23,31 +27,69 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
 
-# root is jffs2 mounted read-only by the vendor cmdline; dropbear needs to
-# write host keys, so make it writable.
 mount -o remount,rw / 2>/dev/null
 
-# --- LAN ---
-LAN=""
-for c in mii0 mii1 mii2; do
-	[ -e "/sys/class/net/$c" ] && LAN="$c" && break
+# ---- debug UART (best effort) --------------------------------------------
+for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
+	[ -c "$t" ] || continue
+	stty -F "$t" 115200 raw -echo 2>/dev/null
+	if printf '\r\n[OW-INIT] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
+		UART="$t"
+		break
+	fi
 done
 
-if [ -n "$LAN" ]; then
-	ip link set "$LAN" up 2>/dev/null || ifconfig "$LAN" up 2>/dev/null
-	ifconfig "$LAN" 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null
-	ip addr add 192.168.1.1/24 dev "$LAN" 2>/dev/null
-	echo "init: LAN=$LAN up" >> /tmp/boot.log
-else
-	ls /sys/class/net >> /tmp/boot.log 2>/dev/null
-fi
+say() {
+	[ -n "$UART" ] && printf '[OW-INIT] %s\r\n' "$1" > "$UART" 2>/dev/null
+	echo "$1" >> /tmp/boot.log 2>/dev/null
+	return 0
+}
 
-# --- ssh ---
+: > /tmp/boot.log
+say "mounted"
+
+# ---- LAN: bring up whatever the kernel exported ---------------------------
+say "netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
+
+LAN=""
+for n in /sys/class/net/*; do
+	d=${n##*/}
+	[ "$d" = "lo" ] && continue
+	ip link set "$d" up 2>/dev/null || ifconfig "$d" up 2>/dev/null
+	ifconfig "$d" 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null
+	ip addr add 192.168.1.1/24 dev "$d" 2>/dev/null
+	case "$d" in
+		mii*) [ -z "$LAN" ] && LAN="$d" ;;
+	esac
+	say "up $d"
+done
+[ -z "$LAN" ] && LAN="(none)"
+say "primary=$LAN"
+
+i=0
+while [ $i -lt 12 ]; do
+	L=""
+	for n in /sys/class/net/*; do
+		d=${n##*/}
+		[ "$d" = "lo" ] && continue
+		[ "$(cat /sys/class/net/$d/operstate 2>/dev/null)" = "up" ] && L="$L $d"
+	done
+	if [ -n "$L" ]; then
+		say "link:$L"
+		break
+	fi
+	i=$((i + 1))
+	sleep 5
+done
+
+# ---- shell access --------------------------------------------------------
 /usr/sbin/dropbear -R -p 22 -P /tmp/dropbear.pid >> /tmp/boot.log 2>&1
-sleep 1
-if [ -f /tmp/dropbear.pid ]; then
-	echo "init: dropbear up" >> /tmp/boot.log
-fi
+[ -f /tmp/dropbear.pid ] && say "dropbear up"
 
-# --- keep PID 1 alive; a real init can be started later over ssh ---
+telnetd -l /bin/sh -p 23 > /tmp/boot.log 2>&1 &
+sleep 1
+say "telnetd 23"
+
+say "ready"
+
 exec /bin/sleep 100000000
