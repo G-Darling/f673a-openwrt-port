@@ -6,26 +6,12 @@ config interface 'loopback'
 
 config globals 'globals'
 	option ula_prefix 'fd00:f673:a9a9::/48'
-	option packet_steering '1'
 
-# ZTE F673AV9a: the vendor kernel exposes LAN switch ports as eth0..eth3
-# (vendor rootfs bridges them into br-lan). Bridge all of them so whichever
-# physical port the PC is plugged into still reaches us.
-config device
-	option name 'br-lan'
-	option type 'bridge'
-	list ports 'eth0'
-	list ports 'eth1'
-	list ports 'eth2'
-	list ports 'eth3'
-
+# Vendor kernel 4.19 has NO bridge module built in and our rootfs only ships
+# 6.12 modules, so br-lan cannot be created. Bind the static address straight
+# onto eth0 (the port u-boot uses for TFTP, i.e. LAN1).
 config interface 'lan'
-	option device 'br-lan'
+	option device 'eth0'
 	option proto 'static'
 	option ipaddr '192.168.1.1'
 	option netmask '255.255.255.0'
-	option ip6assign '60'
-
-config interface 'wan'
-	option proto 'none'
-	option device 'eth4'
