@@ -1,0 +1,52 @@
+name: Make JFFS2 image for F673AV9a
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_release:
+        description: "Release tag containing rootfs.tar.gz"
+        required: false
+        default: "userspace-3"
+
+permissions:
+  contents: write
+
+jobs:
+  jffs2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install mtd-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mtd-utils
+
+      - name: Download rootfs from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.rootfs_release || 'userspace-3' }}" \
+            -R G-Darling/f673a-openwrt-port \
+            -p '*buffalo_ls220de-rootfs.tar.gz' -D .
+          ls -lh *.tar.gz
+
+      - name: Build JFFS2 (128KiB erase block / 2KiB page, little-endian)
+        run: |
+          mkdir -p rootfs
+          TAR=$(ls *buffalo_ls220de-rootfs.tar.gz | head -1)
+          tar xzf "$TAR" -C rootfs
+          # 128KiB block, 2KiB page; keep cleanmarkers for raw NAND partition
+          mkfs.jffs2 -r rootfs -o openwrt-f673a.jffs2 \
+            -e 0x20000 --no-cleanmarkers -q
+          ls -lh openwrt-f673a.jffs2
+          md5sum openwrt-f673a.jffs2
+
+      - name: Publish JFFS2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="jffs2-$(date +%Y%m%d%H%M)"
+          gh release create "$TAG" openwrt-f673a.jffs2 \
+            -R G-Darling/f673a-openwrt-port \
+            --title "OpenWrt JFFS2 rootfs for F673AV9a" \
+            --notes "mkfs.jffs2 -e 128KiB, built from rootfs.tar.gz. Flash into rootfs1 slot (0x1e00000), keep FIT header at 0x1a00000."
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_OUTPUT
