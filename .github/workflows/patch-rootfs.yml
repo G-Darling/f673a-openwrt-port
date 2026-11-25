@@ -120,10 +120,22 @@ jobs:
             echo "NO-MTDBLOCK" >> $L
           fi
           sync
-          for d in eth0 eth1 eth2 eth3; do
-            ifconfig $d 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null
+          for d in eth0 eth1 eth2 eth3 lan; do
+            [ -e /sys/class/net/$d ] || continue
+            ifconfig $d 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null && continue
+            ip link set $d up 2>/dev/null
+            ip addr add 192.168.1.1/24 dev $d 2>/dev/null
           done
           telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
+          sleep 2
+          {
+            echo "-- net --"
+            ip addr 2>&1 | head -20
+            echo "-- netstat --"
+            netstat -lnt 2>&1 | head -10
+          } >> $L
+          [ -e $D ] && dd if=$L of=$D bs=4096 seek=8192 count=1 conv=notrunc 2>/dev/null
+          sync
           sleep 1000000
           SH
           sudo chmod 755 rf/init
