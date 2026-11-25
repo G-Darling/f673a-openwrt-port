@@ -19,6 +19,10 @@ on:
         description: "Set true to replace /init with boot diagnostic (NAND log + telnetd)"
         required: false
         default: "false"
+      uart_init:
+        description: "Set true to install a static ARM init that prints straight to PL011 UART"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -148,6 +152,23 @@ jobs:
           sudo rm -f rf/sbin/init
           sudo cp -a rf/init rf/sbin/init
           sudo chmod 755 rf/sbin/init
+          ls -l rf/init rf/sbin/init
+
+      - name: Build UART diag init (ARM, no libc, no FP)
+        if: ${{ inputs.uart_init == 'true' }}
+        run: |
+          set -e
+          sudo apt-get install -y gcc-arm-linux-gnueabi
+          arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
+            -static -nostdlib -ffreestanding -Wl,-e,_start \
+            -o uart-init tools/diag-uart-init.c
+          file uart-init
+          arm-linux-gnueabi-readelf -h uart-init | grep -iE 'flags|Type|Entry'
+          arm-linux-gnueabi-objdump -d uart-init | grep -ciE 'vldr|vstr|vmov|vadd|fmrx' || true
+          sudo rm -f rf/init rf/sbin/init
+          sudo cp -a uart-init rf/init
+          sudo cp -a uart-init rf/sbin/init
+          sudo chmod 755 rf/init rf/sbin/init
           ls -l rf/init rf/sbin/init
 
       - name: Build JFFS2
