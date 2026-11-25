@@ -26,20 +26,23 @@ jobs:
           arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
             -static -nostdlib -ffreestanding -Wl,-e,_start \
             -o uart-init tools/diag-uart-init.c
-          file uart-init
-          arm-linux-gnueabi-readelf -h uart-init | grep -iE 'Class|Type|Flags|Entry'
+          arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
+            -static -nostdlib -ffreestanding -Wl,-e,_start \
+            -o netprobe-init tools/netprobe-init.c
+          file uart-init netprobe-init
+          arm-linux-gnueabi-readelf -h netprobe-init | grep -iE 'Class|Type|Flags|Entry'
 
       - name: Build minimal rootfs + jffs2
         run: |
           set -e
           rm -rf rfmin && mkdir -p rfmin/sbin rfmin/bin rfmin/dev rfmin/proc rfmin/sys rfmin/tmp rfmin/etc
-          cp uart-init rfmin/sbin/init
-          cp uart-init rfmin/init
+          cp netprobe-init rfmin/sbin/init
+          cp netprobe-init rfmin/init
           chmod 755 rfmin/sbin/init rfmin/init
           sudo mknod -m 622 rfmin/dev/console c 5 1
           sudo mknod -m 666 rfmin/dev/null c 1 3
           printf 'NAME=minimal\n' > rfmin/etc/openwrt_release
-          sudo mkfs.jffs2 -r rfmin -o minimal.jffs2 -e 0x20000 -s 0x800 --no-cleanmarkers -q
+          sudo mkfs.jffs2 -r rfmin -o minimal.jffs2 -e 0x20000 -s 0x800 -q -p 0x20000
           ls -lh minimal.jffs2
           md5sum minimal.jffs2
           python3 -c "d=open('minimal.jffs2','rb').read(); print('size', len(d), 'magic', d[:2].hex())"
