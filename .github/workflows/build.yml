@@ -37,6 +37,18 @@ jobs:
           git clone --depth 1 --branch "${{ inputs.openwrt_tag || 'v25.12.6' }}" \
             https://github.com/openwrt/openwrt.git openwrt
 
+      - name: Drop unrelated DIR-890L image (needs external u-boot.bin, irrelevant to F673A)
+        run: |
+          python3 - <<'PY'
+          import re
+          p = 'openwrt/target/linux/bcm53xx/image/Makefile'
+          s = open(p, encoding='utf-8').read()
+          s2, n = re.subn(r'^define Device/dlink_dir-890l.*?^endef\n', '', s, flags=re.M | re.S)
+          assert n == 1, 'dlink_dir-890l block not found (n=%d)' % n
+          open(p, 'w', encoding='utf-8').write(s2)
+          print('removed dlink_dir-890l device definition (%d bytes)' % (len(s) - len(s2)))
+          PY
+
       - name: Configure feeds
         working-directory: openwrt
         run: |
