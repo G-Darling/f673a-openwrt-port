@@ -1,4 +1,4 @@
-name: Build OpenWrt userspace (armv7)
+name: Build OpenWrt userspace (armv7 SOFT-FLOAT)
 
 on:
   workflow_dispatch:
@@ -7,10 +7,6 @@ on:
         description: "OpenWrt source tag"
         required: false
         default: "v25.12.6"
-      target:
-        description: "OpenWrt TARGET_SUBTARGET (closest arch match)"
-        required: false
-        default: "mvebu/cortexa9"
   push:
     branches: [main]
     paths:
@@ -33,13 +29,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-            python3 python3-setuptools rsync unzip zlib1g-dev file wget xz-utils
+            python3 python3-setuptools rsync unzip zlib1g-dev file wget xz-utils \
+            cpio mtd-utils
 
       - name: Clone OpenWrt source
         run: |
           git clone --depth 1 --branch "${{ inputs.openwrt_tag || 'v25.12.6' }}" \
             https://github.com/openwrt/openwrt.git openwrt
-          cd openwrt
 
       - name: Configure feeds
         working-directory: openwrt
@@ -47,12 +43,14 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Apply userspace config
+      - name: Apply userspace config (soft-float target)
         working-directory: openwrt
         run: |
           cp ../config/userspace.config .config
           make defconfig
-          grep -E "^CONFIG_TARGET_" .config | head -20
+          echo "--- ABI check on generated config ---"
+          grep -E "^CONFIG_TARGET_ARCH_PACKAGES|^CONFIG_SOFT_FLOAT|^CONFIG_TARGET_bcm53xx" .config
+          if grep -q "vfpv3" .config; then echo "::error::still a hard-float target"; exit 1; fi
 
       - name: Download sources
         working-directory: openwrt
@@ -63,27 +61,71 @@ jobs:
         run: |
           make -j$(nproc) IGNORE_ERRORS=n || make -j1 V=s
 
+      - name: Verify soft-float ABI and build JFFS2
+        run: |
+          set -e
+          TAR=$(find openwrt/bin/targets -name "*rootfs.tar.gz" | head -1)
+          echo "rootfs: $TAR"
+          test -n "$TAR"
+          rm -rf /tmp/rf && mkdir -p /tmp/rf
+          sudo tar xzf "$TAR" -C /tmp/rf
+          sudo chown -R root:root /tmp/rf
+
+          echo "--- ELF flags of a few binaries (0x400 bit must be ABSENT) ---"
+          for f in bin/busybox sbin/init lib/libc.so; do
+            if [ -e "/tmp/rf/$f" ]; then
+              python3 - "$f" <<'PY'
+          import struct,sys,os
+          p='/tmp/rf/'+sys.argv[1]
+          d=open(p,'rb').read(64)
+          fl=struct.unpack_from('<I',d,36)[0]
+          print("%-16s machine=%#06x flags=%#010x %s" % (sys.argv[1],
+                struct.unpack_from('<H',d,18)[0], fl, "HARD-FLOAT!!" if fl & 0x400 else "soft-float OK"))
+          sys.exit(1 if fl & 0x400 else 0)
+          PY
+            fi
+          done
+
+          echo "--- build JFFS2 (128KiB eraseblock, 2KiB page, little-endian) ---"
+          sudo mkfs.jffs2 -r /tmp/rf -o openwrt-f673a.jffs2 \
+            -e 0x20000 -s 0x800 --no-cleanmarkers -q
+          ls -lh openwrt-f673a.jffs2
+          md5sum openwrt-f673a.jffs2
+
+          echo "--- verify JFFS2 parses and contains init ---"
+          pip install --quiet jefferson
+          rm -rf /tmp/jf && python3 - <<'PY'
+          import os
+          from pathlib import Path
+          os.mknod = lambda *a, **k: None
+          os.makedev = lambda *a: 0
+          from jefferson.jffs2 import extract_jffs2
+          d = Path('/tmp/jf'); d.mkdir(exist_ok=True)
+          extract_jffs2(Path('openwrt-f673a.jffs2').resolve(), d, 0)
+          assert Path('/tmp/jf/init').exists() or Path('/tmp/jf/sbin/init').exists(), 'no init in jffs2'
+          print('jffs2 OK, init present')
+          PY
+
       - name: Collect artifacts
         run: |
           mkdir -p out
-          TGTDIR=$(echo "${{ inputs.target || 'mvebu/cortexa9' }}" | tr '/' '_')
-          SRC=openwrt/bin/targets/${TGTDIR}
-          find openwrt/bin -name "*rootfs.tar.gz" -exec cp {} out/ \;
+          find openwrt/bin/targets -name "*rootfs.tar.gz" -exec cp {} out/ \;
           find openwrt/bin -name "*.manifest" -exec cp {} out/ \; || true
-          tar czf out/staging-rootfs.tar.gz -C openwrt/staging_dir $(ls openwrt/staging_dir | grep -v host) || true
+          cp openwrt-f673a.jffs2 out/
           ls -lh out/
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="softfloat-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" out/* \
+            -R "${GITHUB_REPOSITORY}" \
+            --title "OpenWrt soft-float userspace for F673AV9a ($TAG)" \
+            --notes "arm_cortex-a9 soft-float (no VFP in vendor kernel). Includes rootfs.tar.gz + openwrt-f673a.jffs2 (mkfs.jffs2 -e 0x20000 -s 0x800 --no-cleanmarkers)."
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-userspace-${{ github.run_number }}
+          name: openwrt-softfloat-${{ github.run_number }}
           path: out/
-
-      - name: Publish release (direct-download artifacts)
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "userspace-${{ github.run_number }}" out/* \
-            --title "OpenWrt userspace build ${{ github.run_number }}" \
-            --notes "Auto-built from config/userspace.config (OpenWrt v25.12.6, mvebu/cortexa9)"
