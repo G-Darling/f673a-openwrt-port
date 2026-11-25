@@ -56,6 +56,8 @@ jobs:
           # overlay (network config bridging eth0..eth3, uci-defaults, ...)
           if [ -d rootfs-overlay ]; then
             cp -a rootfs-overlay/. rf/
+            chmod 755 rf/init rf/sbin/init rf/etc/rc.local 2>/dev/null || true
+            ls -l rf/init rf/sbin/init rf/etc/rc.local || true
           fi
           # root password from input
           HASH=$(openssl passwd -1 -salt f673a '${{ inputs.root_password }}')
