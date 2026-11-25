@@ -113,6 +113,26 @@ static void putdec(long v) {
 }
 static void report(const char *label, long v) { puts_(label); putdec(v); puts_("\r\n"); }
 
+/* 内核可能改过/关过 UART 时钟，依次试几组常见分频比，撞对一组就能看到输出 */
+static void uart_probe(void) {
+    u32 si = U_IBRD, sf = U_FBRD;
+    static const u32 tbl[4][2] = {{13, 1}, {54, 16}, {27, 8}, {6, 49}};
+    int k;
+    for (k = 0; k < 4; k++) {
+        U_CR = 0;
+        U_ICR = 0x7ff;
+        U_IBRD = tbl[k][0];
+        U_FBRD = tbl[k][1];
+        U_LCRH = 0x70;
+        U_CR = 0x301;
+        puts_("\r\n[P");
+        putdec(k);
+        puts_("] UART ALIVE 115200\r\n");
+    }
+    U_IBRD = si ? si : 13;
+    U_FBRD = sf;
+}
+
 /* ---- NAND stage marker: /dev/mtdblock12 offset 0x1800000 (past rootfs) ---- */
 #define MARK_DEV "/dev/mtdblock12"
 #define MARK_OFF 0x1800000
@@ -136,8 +156,10 @@ static void marker(const char *stage, long extra, int has_extra) {
     /* lseek(fd, off, SEEK_SET) = 19 */
     if (sc3(19, fd, MARK_OFF, 0) >= 0) {
         sc3(4, fd, (long)buf, n);
+        sc1(118, fd);            /* fsync: mtdblock 有缓存，必须落盘 */
     }
     sc1(6, fd);
+    sc1(36, 0);                  /* sync */
 }
 
 /* ---- helpers ---- */
@@ -186,10 +208,13 @@ static void run_cmd(const char *cmd) {
 
 /* ---- entry ---- */
 void _start(void) {
+    /* 0. 先写标记：即使 UART 完全不可用也能证明 init 被执行 */
+    marker("ENTRY", 0, 0);
     /* 1. bring the UART back to life first (kernel may have left CR=0) */
+    uart_probe();
     uart_init();
     puts_("\r\n\r\n[UART-INIT] ALIVE\r\n");
-    marker("ENTRY", 0, 0);
+    marker("ALIVE", 0, 0);
 
     sc2(39, (long)"/proc", 0555);
     sc2(39, (long)"/sys", 0555);
