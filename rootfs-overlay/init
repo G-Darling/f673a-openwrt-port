@@ -1,22 +1,29 @@
 #!/bin/sh
-# Minimal bring-up init for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v4 for the ZTE F673AV9a (no usable kernel console).
 #
-# Why this exists: OpenWrt's normal /init -> preinit -> procd chain never gets
-# the board onto the network here, and the kernel has no usable console, so a
-# plain OpenWrt boot is silent and unreachable. This script does the minimum
-# needed to get a shell:
-#   * mount the pseudo filesystems and remount / read-write
-#   * try to make the debug UART usable and report progress on it (best effort)
-#   * bring up EVERY netdev that exists. The name is not stable: the vendor
-#     kernel calls the LAN port mii0, the OpenWrt kernel may call it eth0, so
-#     hard-coding mii0 leaves the port down and the PHY never links.
-#   * start dropbear plus telnetd (telnetd needs no host keys)
-#   * keep PID 1 alive forever (exiting would panic the kernel)
+# v3 brought up every netdev and the board went into a reset loop, so one of
+# the interfaces kills the kernel. Since there is no console, this version
+# persists evidence to a scratch NAND block instead:
+#
+#   scratch = last erase block of the rootfs2 partition (abs 0x59E0000)
+#      +0x0000 : stage log   ("M1 mounted", "PRE eth0", ...)
+#      +0x8000 : kernel dmesg (tail, 30 KB)
+#
+# Both are readable from u-boot with:
+#   nand read 0x52000000 0x59E0000 0x20000 ; md.b 0x52000000 0x100
+#
+# Network is brought up one interface at a time with a marker before and after,
+# so whatever kills the kernel is identified by the last marker written.
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
+SCRATCH_BLK=65536          # 0x59E0000 / 512
+DMESG_BLK=65600            # 0x59E8000 / 512
+DEV=/dev/mtdblock13
+
 UART=""
+STAGE=/tmp/stage
 
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
@@ -26,70 +33,73 @@ mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
-
 mount -o remount,rw / 2>/dev/null
 
-# ---- debug UART (best effort) --------------------------------------------
 for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
 	[ -c "$t" ] || continue
 	stty -F "$t" 115200 raw -echo 2>/dev/null
-	if printf '\r\n[OW-INIT] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
+	if printf '\r\n[OW4] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
 		UART="$t"
 		break
 	fi
 done
 
-say() {
-	[ -n "$UART" ] && printf '[OW-INIT] %s\r\n' "$1" > "$UART" 2>/dev/null
-	echo "$1" >> /tmp/boot.log 2>/dev/null
-	return 0
+[ -e "$DEV" ] || mknod "$DEV" b 31 13 2>/dev/null
+
+flush_stage() {
+	dd if="$STAGE" of="$DEV" bs=512 seek=$SCRATCH_BLK conv=notrunc 2>/dev/null
+	sync
 }
 
-: > /tmp/boot.log
-say "mounted"
+mark() {
+	echo "$1" >> "$STAGE" 2>/dev/null
+	[ -n "$UART" ] && printf '[OW4] %s\r\n' "$1" > "$UART" 2>/dev/null
+	flush_stage
+}
 
-# ---- LAN: bring up whatever the kernel exported ---------------------------
-say "netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
+mark "M1 mounted"
 
-LAN=""
+# kernel log first: it already contains the netdev/phy probe results
+dmesg 2>/dev/null | tail -c 30000 > /tmp/dm
+[ -s /tmp/dm ] && dd if=/tmp/dm of="$DEV" bs=512 seek=$DMESG_BLK conv=notrunc 2>/dev/null
+sync
+mark "M2 dmesg=$(wc -c < /tmp/dm 2>/dev/null)"
+
+mark "M3 net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
+
+# one interface at a time: the marker before the fatal one is the culprit
 for n in /sys/class/net/*; do
 	d=${n##*/}
 	[ "$d" = "lo" ] && continue
+	[ "$d" = "eth0" ] && continue
+	mark "PRE $d"
 	ip link set "$d" up 2>/dev/null || ifconfig "$d" up 2>/dev/null
 	ifconfig "$d" 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null
 	ip addr add 192.168.1.1/24 dev "$d" 2>/dev/null
-	case "$d" in
-		mii*) [ -z "$LAN" ] && LAN="$d" ;;
-	esac
-	say "up $d"
-done
-[ -z "$LAN" ] && LAN="(none)"
-say "primary=$LAN"
-
-i=0
-while [ $i -lt 12 ]; do
-	L=""
-	for n in /sys/class/net/*; do
-		d=${n##*/}
-		[ "$d" = "lo" ] && continue
-		[ "$(cat /sys/class/net/$d/operstate 2>/dev/null)" = "up" ] && L="$L $d"
-	done
-	if [ -n "$L" ]; then
-		say "link:$L"
-		break
-	fi
-	i=$((i + 1))
-	sleep 5
+	sleep 1
+	mark "POST $d state=$(cat /sys/class/net/$d/operstate 2>/dev/null)"
 done
 
-# ---- shell access --------------------------------------------------------
-/usr/sbin/dropbear -R -p 22 -P /tmp/dropbear.pid >> /tmp/boot.log 2>&1
-[ -f /tmp/dropbear.pid ] && say "dropbear up"
+# eth0 last: this is the one suspected of crashing the kernel
+if [ -e /sys/class/net/eth0 ]; then
+	mark "PRE eth0 (last, suspected crash)"
+	ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null
+	sleep 1
+	mark "POST eth0 state=$(cat /sys/class/net/eth0/operstate 2>/dev/null)"
+else
+	mark "no eth0"
+fi
 
-telnetd -l /bin/sh -p 23 > /tmp/boot.log 2>&1 &
+mark "NET DONE"
+
+/usr/sbin/dropbear -R -p 22 -P /tmp/dropbear.pid >> /tmp/stage 2>&1
+[ -f /tmp/dropbear.pid ] && mark "dropbear up"
+telnetd -l /bin/sh -p 23 > /dev/null 2>&1 &
 sleep 1
-say "telnetd 23"
+mark "telnetd 23"
 
-say "ready"
+dmesg 2>/dev/null | tail -c 30000 > /tmp/dm
+[ -s /tmp/dm ] && dd if=/tmp/dm of="$DEV" bs=512 seek=$DMESG_BLK conv=notrunc 2>/dev/null
+mark "READY"
 
 exec /bin/sleep 100000000
