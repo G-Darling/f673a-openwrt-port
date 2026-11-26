@@ -123,7 +123,6 @@ static void putc_(char c) {
 }
 /* Kernel may have changed/stopped the UART clock; try a few common divisors. */
 static void uart_probe(void) {
-    u32 si = U_IBRD, sf = U_FBRD;
     static const u32 tbl[4][2] = {{13, 1}, {54, 16}, {27, 8}, {6, 49}};
     int k;
     for (k = 0; k < 4; k++) {
@@ -137,8 +136,8 @@ static void uart_probe(void) {
         putdec(k);
         puts_("] UART ALIVE 115200\r\n");
     }
-    U_IBRD = si ? si : 13;
-    U_FBRD = sf;
+    U_IBRD = 13;
+    U_FBRD = 1;      /* settle on 24MHz/115200 for all later output */
 }
 
 /* ---- file helpers ---- */
