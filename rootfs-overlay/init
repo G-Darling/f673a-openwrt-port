@@ -1,32 +1,31 @@
 #!/bin/sh
-# Bring-up init v6 for the ZTE F673AV9a (no usable kernel console).
+# Bring-up init v7 for the ZTE F673AV9a (no usable kernel console).
 #
-# v5 reset-looped with NO markers written. zxboot boots slot1 normally
-# (BootImageNum=1, valid[1]=1, FIT hash OK), so the kernel starts and dies
-# ~13s in. Only functional v4->v5 difference: dd really wrote into
-# mtdblock13 - the MOUNTED rootfs partition. Prime suspect: raw write to
-# mtdblock13 panics the kernel.
+# v5/v6 reset-looped with NO markers at all. Ladder evidence:
+#   v4: dd to mtdblock13 BEYOND end-of-device -> fails harmlessly -> STABLE
+#   v5: dd to mtdblock13 at a VALID offset    -> reset loop (~13s)
+#   v6: dd to mtdblock12 at a VALID offset    -> reset loop (~13s)
+# => any real write through the mtdblock CACHE layer panics this kernel.
 #
-# v6: markers go to mtdblock12 (rootfs1 partition, NOT mounted) at
-# partition-relative offset 0x1FE0000 (abs 0x39E0000). Then one probe write
-# to mtdblock13 is performed, bracketed by markers - if it panics, the last
-# marker names it exactly.
+# v7 writes markers through the mtd CHAR device instead, using the static
+# /usr/sbin/nandmark tool (MEMERASE + pwrite) - the same path jffs2 uses.
 #
-#   rootfs1 (abs 0x1A00000..0x3A00000):
-#      part 0x1FE0000 (abs 0x39E0000) : stage log
+#   rootfs1 (mtd "rootfs1", not mounted):
+#      part 0x1FE0000 (abs 0x39E0000) : stage log (each mark re-erases+writes)
 #      part 0x1FE8000 (abs 0x39E8000) : kernel dmesg (tail, 30 KB)
 #   Read from u-boot: nand read 0x52000000 0x39e0000 0x20000
+#
+# One probe write to the MOUNTED rootfs2 (char device) is bracketed by
+# markers so a panic there names itself.
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
-SCRATCH_OFF=$((0x1FE0000))  # inside rootfs1 partition
-DMESG_OFF=$((0x1FE8000))
-SCRATCH_BLK=$((SCRATCH_OFF / 512))   # 65280
-DMESG_BLK=$((DMESG_OFF / 512))       # 65344
-
-UART=""
+NM=/usr/sbin/nandmark
+SCRATCH=1FE0000
+DMESG_OFF=1FE8000
 STAGE=/tmp/stage
+DMF=/tmp/dm
 
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
@@ -38,60 +37,47 @@ mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
 mount -o remount,rw / 2>/dev/null
 
-# marker target: rootfs1 partition (unmounted); probe target: rootfs2 (mounted root)
 MTDA=$(sed -n 's/^mtd\([0-9][0-9]*\):.*rootfs1.*/\1/p' /proc/mtd 2>/dev/null | head -n 1)
 [ -n "$MTDA" ] || MTDA=12
-DEVA=/dev/mtdblock$MTDA
-[ -e "$DEVA" ] || mknod "$DEVA" b 31 "$MTDA" 2>/dev/null
+DEVA=/dev/mtd$MTDA
+[ -e "$DEVA" ] || mknod "$DEVA" c 90 $((MTDA * 2)) 2>/dev/null
 MTDB=$(sed -n 's/^mtd\([0-9][0-9]*\):.*rootfs2.*/\1/p' /proc/mtd 2>/dev/null | head -n 1)
 [ -n "$MTDB" ] || MTDB=13
-DEVB=/dev/mtdblock$MTDB
+DEVB=/dev/mtd$MTDB
 
 for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
 	[ -c "$t" ] || continue
 	stty -F "$t" 115200 raw -echo 2>/dev/null
-	if printf '\r\n[OW6] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
+	if printf '\r\n[OW7] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
 		UART="$t"
 		break
 	fi
 done
 
-pad512() {
-	while [ $(( $(wc -c < "$1") % 512 )) -ne 0 ]; do
-		echo >> "$1"
-	done
-}
-
-flush_stage() {
-	pad512 "$STAGE"
-	dd if="$STAGE" of="$DEVA" bs=512 seek=$SCRATCH_BLK conv=notrunc 2>/dev/null
-	sync
-}
-
-flush_dmesg() {
-	dmesg 2>/dev/null | tail -c 30000 > /tmp/dm
-	pad512 /tmp/dm
-	dd if=/tmp/dm of="$DEVA" bs=512 seek=$DMESG_BLK conv=notrunc 2>/dev/null
-	sync
-}
+: > "$STAGE"
+RCLAST=none
 
 mark() {
-	echo "$1" >> "$STAGE" 2>/dev/null
-	[ -n "$UART" ] && printf '[OW6] %s\r\n' "$1" > "$UART" 2>/dev/null
-	flush_stage
+	echo "rc=$RCLAST" >> "$STAGE"
+	echo "$1" >> "$STAGE"
+	[ -n "$UART" ] && printf '[OW7] %s\r\n' "$1" > "$UART" 2>/dev/null
+	RCLAST=$("$NM" "$DEVA" "$STAGE" "$SCRATCH" 2>&1 | tail -n 1)
 }
 
-mark "M1 mounted a=$DEVA b=$DEVB"
+markdm() {
+	dmesg 2>/dev/null | tail -c 30000 > "$DMF"
+	mark "$1"
+	"$NM" "$DEVA" "$DMF" "$DMESG_OFF" > /dev/null 2>&1
+}
+
+markdm "M0 alive nm=$([ -x $NM ] && echo yes || echo NO) a=$DEVA b=$DEVB"
 mark "mtdmap $(cat /proc/mtd 2>/dev/null | tr '\n' '|')"
 
-# THE experiment: one probe write into the mounted rootfs2 partition
-mark "TEST-B begin dd->mtdblock$MTDB seek=65280"
-dd if="$STAGE" of="$DEVB" bs=512 seek=65280 conv=notrunc 2>/dev/null
-sync
-mark "TEST-B ok (mtdblock$MTDB write survived)"
-
-flush_dmesg
-mark "M2 dmesg=$(wc -c < /tmp/dm 2>/dev/null)"
+# THE experiment: one probe write to the mounted rootfs2, via char device
+mark "TEST-B begin nandmark->$DEVB @$SCRATCH"
+"$NM" "$DEVB" "$STAGE" "$SCRATCH" > /tmp/tb 2>&1
+echo "TEST-B probe rc: $(cat /tmp/tb 2>/dev/null)" >> "$STAGE"
+mark "TEST-B done (char-dev write to mounted root survived)"
 
 mark "M3 net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
 
@@ -126,7 +112,6 @@ telnetd -l /bin/sh -p 23 > /dev/null 2>&1 &
 sleep 1
 mark "telnetd 23"
 
-flush_dmesg
-mark "READY"
+markdm "READY"
 
 exec /bin/sleep 100000000
