@@ -37,7 +37,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y mtd-utils python3 python3-pip openssl
+          sudo apt-get install -y mtd-utils python3 python3-pip openssl gcc-arm-linux-gnueabi
 
       - name: Download base rootfs
         env:
@@ -172,6 +172,17 @@ jobs:
           sudo cp -a uart-init rf/sbin/init
           sudo chmod 755 rf/init rf/sbin/init
           ls -l rf/init rf/sbin/init
+
+      - name: Build nandmark (ARM static, soft-float)
+        run: |
+          set -e
+          arm-linux-gnueabi-gcc -march=armv7-a -mfloat-abi=soft -O2 -static \
+            -o nandmark tools/nandmark.c
+          file nandmark
+          arm-linux-gnueabi-readelf -h nandmark | grep -iE 'Flags|Entry'
+          sudo mkdir -p rf/usr/sbin
+          sudo cp nandmark rf/usr/sbin/nandmark
+          sudo chmod 755 rf/usr/sbin/nandmark
 
       - name: Build JFFS2
         run: |
