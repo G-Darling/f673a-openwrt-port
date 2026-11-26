@@ -20,7 +20,30 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#include <linux/mtd/mtd-user.h>
+
+/*
+ * The arm-linux-gnueabi sysroot has no linux/mtd/mtd-user.h, so the MTD
+ * ABI is declared here. These ioctl numbers are a frozen ABI:
+ *   MEMGETINFO = _IOR('M', 1, int)                 = 0x80044D01
+ *   MEMERASE   = _IOW('M', 2, struct erase_info_user(8)) = 0x40084D02
+ */
+struct mtd_info_u {
+    unsigned char type;
+    unsigned int flags;
+    unsigned int size;
+    unsigned int erasesize;
+    unsigned int writesize;
+    unsigned int oobsize;
+    unsigned long long padding;
+    unsigned int eccbytes;
+    unsigned int eccstrength;
+};
+struct erase_info_u {
+    unsigned int start;
+    unsigned int length;
+};
+#define MTD_MEMGETINFO 0x80044D01U
+#define MTD_MEMERASE   0x40084D02U>
 
 #define MAXSZ (128 * 1024)
 
@@ -28,13 +51,13 @@ static char buf[MAXSZ];
 
 static int do_write(int fd, const char *file, unsigned long off)
 {
-    struct mtd_info_user mi;
-    struct erase_info_user ei;
+    struct mtd_info_u mi;
+    struct erase_info_u ei;
     FILE *f;
     unsigned long ebs, astart, plen, sz;
     ssize_t n;
 
-    if (ioctl(fd, MEMGETINFO, &mi) < 0)
+    if (ioctl(fd, MTD_MEMGETINFO, &mi) < 0)
         return -10;
     ebs = mi.erasesize;
     if (off % mi.writesize || off % ebs)
@@ -50,7 +73,7 @@ static int do_write(int fd, const char *file, unsigned long off)
 
     ei.start = astart;
     ei.length = ebs;
-    if (ioctl(fd, MEMERASE, &ei) < 0)
+    if (ioctl(fd, MTD_MEMERASE, &ei) < 0)
         return -13;
 
     plen = ((sz + mi.writesize - 1) / mi.writesize) * mi.writesize;
