@@ -43,7 +43,7 @@ struct erase_info_u {
     unsigned int length;
 };
 #define MTD_MEMGETINFO 0x80044D01U
-#define MTD_MEMERASE   0x40084D02U>
+#define MTD_MEMERASE   0x40084D02U
 
 #define MAXSZ (128 * 1024)
 
