@@ -163,7 +163,7 @@ jobs:
           sudo apt-get install -y gcc-arm-linux-gnueabi
           arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
             -static -nostdlib -ffreestanding -Wl,-e,_start \
-            -o uart-init tools/diag-uart-init.c
+            -o uart-init tools/uart-insmod-diag.c
           file uart-init
           arm-linux-gnueabi-readelf -h uart-init | grep -iE 'flags|Type|Entry'
           arm-linux-gnueabi-objdump -d uart-init | grep -ciE 'vldr|vstr|vmov|vadd|fmrx' || true
