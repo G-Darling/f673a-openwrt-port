@@ -1,19 +1,14 @@
 #!/bin/sh
-# Bring-up init v9 for the ZTE F673AV9a (vendor 4.19.136 kernel, no console).
+# Bring-up init v9c for the ZTE F673A (vendor 4.19.136 kernel, no console).
 #
-# BREAKTHROUGH since v8: the LAN MAC/PHY drivers are NOT built into the
-# vendor kernel. They live in /kmoduletmp/kmodule.img (a squashfs the kernel
-# loop-mounts onto /kmodule at boot). We extracted the modules from the
-# vendor image and bake them into our rootfs at /kmodule/*.ko instead.
+# v9c = bisect step 3: bspdriver + netdriver insmod ONLY, NO network bring-up.
+# Rationale: v9b (bspdriver+netdriver, full bring-up) reset-loops; v8 (no
+# modules) is stable. This run separates "insmod panics" from "bring-up
+# (ip link up/ifconfig/ping) panics":
+#   - stable here  -> panic is in the bring-up path (link event / PHY ioctls)
+#   - still loops  -> netdriver (or bspdriver) insmod itself panics
 #
-# Load order mirrors vendor S43BSPDriver + S99modules:
-#   bspdriver -> tm_128s -> netdriver -> switch
-# (switch depends on tm_128s; netdriver needs the MAC/PHY registered.)
-#
-# HARD RULE kept from v8: NEVER write to NAND (v3/5/6/7 reset loops proved
-# any real write panics this kernel). Everything goes to tmpfs; root stays ro.
-# Diagnostics: if no netdev appears we warm-reboot so the PC-side serial
-# monitor can time the cycles; if a netdev appears we stay alive with telnetd.
+# HARD RULE kept from v8: NEVER write to NAND. Everything to tmpfs.
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
@@ -30,39 +25,18 @@ mount -t tmpfs tmpfs /var/run 2>/dev/null
 
 for m in bspdriver netdriver; do
 	if /sbin/insmod /kmodule/$m.ko 2>>/tmp/boot.log; then
-		echo "[V9B] insmod $m OK" >> /tmp/boot.log
+		echo "[V9C] insmod $m OK" >> /tmp/boot.log
 	else
-		echo "[V9B] insmod $m FAILED" >> /tmp/boot.log
+		echo "[V9C] insmod $m FAILED" >> /tmp/boot.log
 	fi
 	sleep 1
 done
 
-# wait up to 20s for netdevs from netdriver
-i=0
-while [ $i -lt 20 ]; do
-	N=$(ls /sys/class/net 2>/dev/null | grep -v lo)
-	[ -n "$N" ] && break
-	sleep 1
-	i=$((i + 1))
-done
-echo "[V9B] netdevs after ${i}s: $(ls /sys/class/net 2>/dev/null | tr '\n' ',')" >> /tmp/boot.log
-
-ip link set lo up 2>/dev/null
-for n in /sys/class/net/*; do
-	d=${n##*/}
-	[ "$d" = "lo" ] && continue
-	ip link set "$d" up 2>/dev/null || ifconfig "$d" up 2>/dev/null
-	sleep 2
-	ifconfig "$d" 192.168.1.1 netmask 255.255.255.0 2>/dev/null ||
-		ip addr add 192.168.1.1/24 dev "$d" 2>/dev/null
-	ping -c 2 -W 2 192.168.1.254 >/dev/null 2>&1 &&
-		echo "[V9B] PING-OK via $d" >> /tmp/boot.log
-	echo "[V9B] up $d st=$(cat /sys/class/net/$d/operstate 2>/dev/null)" >> /tmp/boot.log
-done
+# just observe, do NOT touch the interfaces
+sleep 10
+echo "[V9C] netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ',')" >> /tmp/boot.log
 
 telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
-echo "[V9B] telnetd up" >> /tmp/boot.log
+echo "[V9C] telnetd up" >> /tmp/boot.log
 
-# stay alive forever - if the PC got a link, telnet 192.168.1.1 works;
-# otherwise power-cycle for the next experiment (no marker channel exists)
 exec sleep 100000000
