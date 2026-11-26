@@ -28,7 +28,7 @@ mount -t tmpfs tmpfs /var/run 2>/dev/null
 
 : > /tmp/boot.log
 
-for m in patch shellproc bspdriver tm_128s netdriver switch; do
+for m in patch shellproc bspdriver netdriver; do
 	if /sbin/insmod /kmodule/$m.ko 2>>/tmp/boot.log; then
 		echo "[V9] insmod $m OK" >> /tmp/boot.log
 	else
