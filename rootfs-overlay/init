@@ -23,20 +23,20 @@ mount -t tmpfs tmpfs /var/run 2>/dev/null
 
 : > /tmp/boot.log
 
-for m in bspdriver; do
+for m in tun; do
 	if /sbin/insmod /kmodule/$m.ko 2>>/tmp/boot.log; then
-		echo "[V9D] insmod $m OK" >> /tmp/boot.log
+		echo "[V9E] insmod $m OK" >> /tmp/boot.log
 	else
-		echo "[V9D] insmod $m FAILED" >> /tmp/boot.log
+		echo "[V9E] insmod $m FAILED" >> /tmp/boot.log
 	fi
 	sleep 1
 done
 
 # just observe, do NOT touch the interfaces
 sleep 10
-echo "[V9D] netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ',')" >> /tmp/boot.log
+echo "[V9E] netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ',')" >> /tmp/boot.log
 
 telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
-echo "[V9D] telnetd up" >> /tmp/boot.log
+echo "[V9E] telnetd up" >> /tmp/boot.log
 
 exec sleep 100000000
