@@ -1,7 +1,7 @@
 #!/bin/sh
-# Bring-up init v9c for the ZTE F673A (vendor 4.19.136 kernel, no console).
+# Bring-up init v9d for the ZTE F673A (vendor 4.19.136 kernel, no console).
 #
-# v9c = bisect step 3: bspdriver + netdriver insmod ONLY, NO network bring-up.
+# v9d = bisect step 4: bspdriver ONLY (no netdriver), insmod only.
 # Rationale: v9b (bspdriver+netdriver, full bring-up) reset-loops; v8 (no
 # modules) is stable. This run separates "insmod panics" from "bring-up
 # (ip link up/ifconfig/ping) panics":
@@ -23,20 +23,20 @@ mount -t tmpfs tmpfs /var/run 2>/dev/null
 
 : > /tmp/boot.log
 
-for m in bspdriver netdriver; do
+for m in bspdriver; do
 	if /sbin/insmod /kmodule/$m.ko 2>>/tmp/boot.log; then
-		echo "[V9C] insmod $m OK" >> /tmp/boot.log
+		echo "[V9D] insmod $m OK" >> /tmp/boot.log
 	else
-		echo "[V9C] insmod $m FAILED" >> /tmp/boot.log
+		echo "[V9D] insmod $m FAILED" >> /tmp/boot.log
 	fi
 	sleep 1
 done
 
 # just observe, do NOT touch the interfaces
 sleep 10
-echo "[V9C] netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ',')" >> /tmp/boot.log
+echo "[V9D] netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ',')" >> /tmp/boot.log
 
 telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
-echo "[V9C] telnetd up" >> /tmp/boot.log
+echo "[V9D] telnetd up" >> /tmp/boot.log
 
 exec sleep 100000000
