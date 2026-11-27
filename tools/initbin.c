@@ -181,7 +181,7 @@ void _start(void) {
     /* 1. mounts: proc (independent of /dev) */
     rc = sys_mount("proc", "/proc", "proc", 0, 0);
     klen = 0;
-    klog_add("[INITBIN] v6 alive mount proc=");
+    klog_add("[INITBIN] v7 alive mount proc=");
     klog_num(rc);
 
     /* 2. writable /dev: tmpfs -> ramfs -> devtmpfs */
@@ -235,11 +235,20 @@ void _start(void) {
     /* 6. spawn the bring-up script */
     spawn_init();
 
-    /* 7. PID1 never exits: feed wdt, reap children, respawn /init */
+    /* 7. PID1 never exits: feed wdt, reap children, respawn /init.
+     * v7 DIAG MODE: feed the watchdog for only FEED_SECONDS, then STOP.
+     * The 16s heartbeat then fires a warm reset -> U-Boot with DRAM intact,
+     * giving us a minable __log_buf with the full [V19] bring-up trace.
+     * (The board then reset-loops every ~FEED_SECONDS+16s, which is exactly
+     * what we want for mining.) */
+#define FEED_SECONDS 120
     for (i = 1; ; i++) {
         int st = 0;
         sys_nanosleep(3, 0);
-        if (feed_watchdog() != 0) {
+        if ((i - 1) * 3 >= FEED_SECONDS) {
+            if ((i % 10) == 1)
+                klog("[INITBIN] diag: watchdog feed stopped - warm reset imminent");
+        } else if (feed_watchdog() != 0) {
             if ((i % 10) == 0)
                 klog("[INITBIN] watchdog feed FAILED (all paths)");
         } else if ((i % 40) == 1) {
