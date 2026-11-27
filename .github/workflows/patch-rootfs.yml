@@ -192,6 +192,20 @@ jobs:
           sudo cp netshell rf/usr/sbin/netshell
           sudo chmod 755 rf/usr/sbin/netshell
 
+      - name: Build initbin (static PID1: UART + kmsg + watchdog + spawn /init)
+        run: |
+          set -e
+          arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
+            -static -nostdlib -ffreestanding -Wl,-e,_start \
+            -o initbin tools/initbin.c
+          arm-linux-gnueabi-readelf -h initbin | grep -iE 'Entry|Type'
+          # PID1 = initbin (static ELF, never exits). It mounts /dev, feeds the
+          # vendor watchdog, mirrors kmsg to UART and respawns /init on crash.
+          sudo rm -f rf/sbin/init
+          sudo cp initbin rf/sbin/init
+          sudo chmod 755 rf/sbin/init
+          ls -l rf/sbin/init rf/init
+
       - name: Build nandmark (ARM static, soft-float)
         run: |
           set -e
