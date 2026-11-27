@@ -181,6 +181,17 @@ jobs:
           sudo chmod 755 rf/init rf/sbin/init
           ls -l rf/init rf/sbin/init
 
+      - name: Build netshell (ARM static, no libc)
+        run: |
+          set -e
+          arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
+            -static -nostdlib -ffreestanding -Wl,-e,_start \
+            -o netshell tools/netshell.c
+          arm-linux-gnueabi-readelf -h netshell | grep -iE 'Entry|Type'
+          sudo mkdir -p rf/usr/sbin
+          sudo cp netshell rf/usr/sbin/netshell
+          sudo chmod 755 rf/usr/sbin/netshell
+
       - name: Build nandmark (ARM static, soft-float)
         run: |
           set -e
