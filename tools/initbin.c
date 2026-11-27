@@ -182,7 +182,7 @@ void _start(void) {
     /* 1. mounts: proc (independent of /dev) */
     rc = sys_mount("proc", "/proc", "proc", 0, 0);
     klen = 0;
-    klog_add("[INITBIN] v8 alive mount proc=");
+    klog_add("[INITBIN] v9 alive mount proc=");
     klog_num(rc);
 
     /* 2. writable /dev: tmpfs -> ramfs -> devtmpfs */
@@ -207,7 +207,7 @@ void _start(void) {
     if (kmsg_fd < 0) {
         /* nothing else to do but idle (never exit, avoid init-kill panic) */
         for (;;)
-            sys_nanosleep(60, 0);
+            sys_nanosleep(150, 0);
     }
 
     klog("[INITBIN] kmsg channel live - diagnostics from here on");
@@ -241,7 +241,7 @@ void _start(void) {
      * (warm reset, DRAM preserved) so the __log_buf with the full
      * [V19] trace can be mined from U-Boot. Board then cycles:
      * Linux ~60s + boot ~35s. Interrupt autoboot to mine. */
-#define REBOOT_SECONDS 60
+#define REBOOT_SECONDS 150
     for (i = 1; ; i++) {
         int st = 0;
         sys_nanosleep(3, 0);
