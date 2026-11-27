@@ -78,14 +78,22 @@ jobs:
           import os
           p = 'rf/etc/config/dropbear'
           if not os.path.exists(p):
-              open(p, 'w').write("config dropbear\n\toption PasswordAuth 'on'\n\toption RootPasswordAuth 'on'\n\toption Port '22'\n")
+            open(p, 'w').write("config dropbear\n\toption PasswordAuth 'on'\n\toption RootPasswordAuth 'on'\n\toption Port '22'\n")
           else:
-              s = open(p).read()
-              if 'PasswordAuth' not in s:
-                  s += "\toption PasswordAuth 'on'\n\toption RootPasswordAuth 'on'\n"
-              open(p, 'w').write(s)
+            s = open(p).read()
+            if 'PasswordAuth' not in s:
+              s += "\toption PasswordAuth 'on'\n\toption RootPasswordAuth 'on'\n"
+            open(p, 'w').write(s)
           print('dropbear config ok')
           PY
+          # pre-bake dropbear host keys (OpenSSH format, dropbear >=2020.79 reads
+          # them) so the board NEVER needs runtime keygen (/dev/random may block
+          # on this vendor kernel). Keys are only read at runtime, never written.
+          sudo mkdir -p rf/etc/dropbear
+          sudo ssh-keygen -t ed25519 -f rf/etc/dropbear/dropbear_ed25519_host_key -N '' -q
+          sudo ssh-keygen -t rsa -b 2048 -f rf/etc/dropbear/dropbear_rsa_host_key -N '' -q
+          sudo chmod 600 rf/etc/dropbear/dropbear_*_host_key
+          ls -l rf/etc/dropbear/
           sudo chown -R root:root rf
           sudo mkdir -p rf/dev && sudo mknod -m 622 rf/dev/console c 5 1 || true
 
