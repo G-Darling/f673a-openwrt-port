@@ -286,11 +286,11 @@ void _start(void) {
         long rc2 = sys_mount("sysfs", "/sys", "sysfs", 0, 0);
         long rc3 = sys_mount("tmpfs", "/dev", "tmpfs", 0, 0);
         /* /dev is now a writable tmpfs: create the nodes we need */
-        sys_mknod("/dev/kmsg", 0x20 | 0600, 0x0b0001);      /* c 1:11 */
-        sys_mknod("/dev/null", 0x20 | 0666, 0x010003);      /* c 1:3  */
-        sys_mknod("/dev/console", 0x20 | 0600, 0x050001);   /* c 5:1  */
-        sys_mknod("/dev/watchdog", 0x20 | 0600, 0x0a0082);  /* c 10:130 */
-        sys_mknod("/dev/mem", 0x20 | 0600, 0x010001);       /* c 1:1  */
+        sys_mknod("/dev/kmsg", 0x2000 | 0600, (1 << 8) | 11);     /* chr 1:11 */
+        sys_mknod("/dev/null", 0x2000 | 0666, (1 << 8) | 3);      /* chr 1:3  */
+        sys_mknod("/dev/console", 0x2000 | 0600, (5 << 8) | 1);   /* chr 5:1  */
+        sys_mknod("/dev/watchdog", 0x2000 | 0600, (10 << 8) | 130); /* chr 10:130 */
+        sys_mknod("/dev/mem", 0x2000 | 0600, (1 << 8) | 1);       /* chr 1:1  */
         /* now /dev/kmsg exists regardless of devtmpfs support */
         klog_add("[INITBIN] v4 alive proc=");
         klog_num(rc1); klog_add(" sys="); klog_num(rc2);
