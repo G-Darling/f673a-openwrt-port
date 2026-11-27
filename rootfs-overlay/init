@@ -1,31 +1,23 @@
 #!/bin/sh
-# Bring-up init v15 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v16 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v14 finding: even with the nc:5555 log server started before the netdev
-# loop, ALL ports stayed refused while ping answered -> PID1 hangs BEFORE
-# the nc loop. The only blocking-capable code before it is the UART beacon:
-# `stty -F /dev/ttyXXX` / `printf > /dev/ttyXXX` open() a PL011/tty device
-# synchronously; if the driver waits for DCD carrier the open blocks forever.
-# This beacon existed in v8..v14 and explains why no init ever reached
-# telnetd/dropbear: PID1 was wedged right after mount, at the first tty open.
-# (ping answered because the first netdev already had 192.168.1.1 from... no
-#  wait - ping answering proves IP was set; revisit: beacon is BEFORE netdev
-#  bring-up, so if PID1 hung there, nothing would set the IP. => suspect the
-#  hang is in the beacon loop only when tty opens succeed but stty wedges, or
-#  the beacon runs fine and the wedge was elsewhere. v15 guards everything.)
-#
-# v15 hardening:
-#   * UART beacon moved to BACKGROUND (a blocked tty open can no longer
-#     wedge PID1); log() works without it
-#   * dropbear (pre-baked keys) starts BEFORE the netdev loop
-#   * nc:5555 log dump + nc:23 shell fallback also start early
-#   * every per-netdev command is timeout-guarded
-#   * runtime keygen only as last resort, `timeout 60` guarded
+# UNIFIED EXPLANATION of v11..v15 symptoms (ping OK, every port refused,
+# board stable):
+#   1. OpenWrt busybox nc is CLIENT-ONLY (usage "nc [IPADDR PORT]", no -l/-p/-e)
+#      -> all nc "listeners" (5555 log dump, 23 shell) were no-ops
+#   2. telnetd applet absent from busybox
+#   3. dropbear 2025.89 with baked OpenSSH keys still failed to start
+#      (reason invisible: no working remote log channel)
+#   4. v12: foreground dropbearkey hung -> PID1 wedged after IP assignment
+# Fix in v16: /usr/sbin/netshell - a no-libc static ARM TCP shell server
+# (raw syscalls, fork+execve /bin/sh, listens on 23). Nothing external
+# needed; busybox sh is known to work on the board (ip/ping/ifconfig ran).
+# eth* must NOT be opened on the vendor kernel (OOPS + watchdog reset).
 #
 # Remote access after boot (PC = 192.168.1.254):
-#   ssh root@192.168.1.1   (password f673a2026)  <- primary
-#   nc 192.168.1.1 23      (busybox nc shell fallback, if -e supported)
-#   nc 192.168.1.1 5555    (one-shot dump of /tmp/boot.log)
+#   nc 192.168.1.1 23   -> busybox shell (primary now)
+#   ssh root@192.168.1.1 (pw f673a2026) if dropbear starts
+# Boot log: cat /tmp/boot.log once connected.
 #
 # HARD RULE: NEVER write to NAND. Root stays read-only.
 
@@ -43,7 +35,7 @@ mount -t tmpfs tmpfs /var/run 2>/dev/null
 L=/tmp/boot.log
 : > "$L"
 log() {
-	echo "[V15] $(cut -d' ' -f1 /proc/uptime 2>/dev/null) $1" >> "$L"
+	echo "[V16] $(cut -d' ' -f1 /proc/uptime 2>/dev/null) $1" >> "$L"
 }
 
 log "start"
@@ -51,64 +43,63 @@ log "ver $(cat /proc/version 2>/dev/null)"
 log "cmdline: $(cat /proc/cmdline 2>/dev/null)"
 log "netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
 log "mtd: $(cut -d' ' -f1,3,4 /proc/mtd 2>/dev/null | tr '\n' ' ')"
+log "urandom: $(ls -l /dev/urandom 2>&1 | head -1)"
+log "dropbear keys: $(ls /etc/dropbear/ 2>&1 | tr '\n' ' ')"
 
-# ---- UART beacon: BACKGROUND ONLY (a tty open() must never wedge PID1) ----
+# ---- UART beacon: background only, never wedge PID1 -----------------------
 (
 	for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
 		[ -c "$t" ] || continue
 		timeout 3 stty -F "$t" 115200 raw -echo >/dev/null 2>&1 || continue
-		timeout 3 sh -c "printf '\r\n[V15] alive on $t\r\n' > $t" >/dev/null 2>&1 || continue
+		timeout 3 sh -c "printf '\r\n[V16] alive on $t\r\n' > $t" >/dev/null 2>&1 || continue
 		echo "$t" > /tmp/uart_beacon_dev
 		break
 	done
 ) </dev/null &
 
-# ---- remote services FIRST (before anything that can hang) ----------------
-# boot.log one-shot dump per connection
-(while :; do nc -l -p 5555 < "$L" >/dev/null 2>&1; sleep 1; done) </dev/null &
-log "nc 5555 log server started"
-
-# shell fallback if busybox nc supports -e
-if nc --help 2>&1 | grep -q -- '-e'; then
-	(while :; do nc -l -p 23 -e /bin/sh >/dev/null 2>&1; sleep 1; done) </dev/null &
-	log "nc 23 shell fallback started"
+# ---- netshell: no-libc static TCP shell server on 23 ----------------------
+if [ -x /usr/sbin/netshell ]; then
+	/usr/sbin/netshell </dev/null >>"$L" 2>&1 &
+	log "netshell started on 23"
 else
-	log "nc has no -e, shell fallback skipped"
+	log "netshell MISSING"
 fi
 
-# dropbear with pre-baked OpenSSH-format keys (image is read-only at runtime)
+# ---- dropbear on 22 (baked OpenSSH keys; stderr into boot.log) ------------
 BKEYS=""
 for k in /etc/dropbear/dropbear_ed25519_host_key \
          /etc/dropbear/dropbear_rsa_host_key; do
 	[ -s "$k" ] && BKEYS="$BKEYS -r $k"
 done
 if [ -n "$BKEYS" ]; then
-	log "baked keys present"
 	/usr/sbin/dropbear -p 22 $BKEYS </dev/null >>"$L" 2>&1 &&
 		log "dropbear 22 started (baked keys)" ||
-		log "dropbear with baked keys FAILED rc=$?"
+		log "dropbear baked-keys start FAILED rc=$?"
 fi
 
-# fallback: runtime keygen, timeout-guarded, only if dropbear is not up
+# fallback: runtime keygen, timeout-guarded, background
 if ! pidof dropbear >/dev/null 2>&1; then
-	log "fallback keygen (timeout 60 each)"
 	(
-		timeout 60 dropbearkey -t ed25519 -f /tmp/dk_ed25519 </dev/null >/dev/null 2>&1
-		timeout 60 dropbearkey -t rsa -s 2048 -f /tmp/dk_rsa </dev/null >/dev/null 2>&1
+		timeout 60 dropbearkey -t ed25519 -f /tmp/dk_ed25519 </dev/null >/tmp/dk_ed.err 2>&1
+		timeout 60 dropbearkey -t rsa -s 2048 -f /tmp/dk_rsa </dev/null >/tmp/dk_rsa.err 2>&1
 		F=""
 		[ -s /tmp/dk_ed25519 ] && F="$F -r /tmp/dk_ed25519"
 		[ -s /tmp/dk_rsa ] && F="$F -r /tmp/dk_rsa"
-		[ -n "$F" ] && /usr/sbin/dropbear -p 22 $F </dev/null >/tmp/dbr.err 2>&1
+		[ -n "$F" ] && /usr/sbin/dropbear -p 22 $F </dev/null >>"$L" 2>&1
 		echo done > /tmp/fb_done
 	) </dev/null &
+	log "fallback keygen dispatched (background)"
 fi
 
-# ---- netdev bring-up (all timeout-guarded) --------------------------------
+# ---- netdev bring-up (timeout-guarded; NEVER touch eth*) ------------------
 ip link set lo up 2>/dev/null
 
 for n in /sys/class/net/*; do
 	d=${n##*/}
 	[ "$d" = "lo" ] && continue
+	case "$d" in
+	eth*) log "SKIP $d (opening eth* OOPSes the vendor kernel)"; continue ;;
+	esac
 	log "PRE $d"
 	timeout 8 ip link set "$d" up >/dev/null 2>&1 ||
 		log "LINK-UP $d: timeout/fail"
@@ -130,6 +121,7 @@ while [ $i -lt 30 ]; do
 	for n in /sys/class/net/*; do
 		d=${n##*/}
 		[ "$d" = "lo" ] && continue
+		case "$d" in eth*) continue ;; esac
 		[ "$(cat /sys/class/net/$d/operstate 2>/dev/null)" = "up" ] && LINKED="$LINKED $d"
 	done
 	[ -n "$LINKED" ] && break
@@ -137,6 +129,6 @@ while [ $i -lt 30 ]; do
 	i=$((i + 1))
 done
 log "LINKED=$LINKED"
-log "staying alive - ssh root@192.168.1.1 (pw f673a2026), nc 5555 for boot.log"
+log "staying alive - nc 192.168.1.1 23 for shell, cat /tmp/boot.log"
 
 exec sleep 100000000
