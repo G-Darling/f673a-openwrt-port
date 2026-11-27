@@ -1,56 +1,72 @@
 #!/bin/sh
-# Bring-up init v20 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v21 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v19 board-test results (2026-11-27, via __log_buf mining of initbin v8):
-#   * /sbin/init (static initbin) + spawn /bin/sh /init: PROVEN WORKING.
-#     Ring showed: mount proc=0 dev=0 mknod=0 kmsg=3F, sysfs rc=0,
-#     /dev/watchdog open=-19 (ENODEV, fallback proc feed works, wdt_path=2),
-#     spawned /init pid=712, diag reboot at 60s -> warm reset, DRAM intact.
-#   * /init DID run (set -x traces visible) but ALL its /dev/kmsg output
-#     was eaten by the kernel devkmsg ratelimiter:
-#     "sh: 9 output lines suppressed due to ratelimiting"
-#     => set -x floods /dev/kmsg far beyond the 10-msg-per-5s budget.
-#   * vendor driver spams "get_items failed" every ~2s (thermal/wdt proc
-#     poller) - pollutes the ring but does not consume our kmsg budget.
+# v20 board-test results (2026-11-27, via __log_buf mining of initbin v9):
+#   * initbin v9 PROVEN: alive t=0s/t=120s, wdt_path=2 proc feed OK,
+#     diag reboot at 150s -> warm reset, DRAM ring intact. Toolchain closed.
+#   * /init DIED AT LINE 40: "exec 3>/dev/watchdog" - POSIX rule: in a
+#     non-interactive shell, `exec` with a FAILING redirection EXITS the
+#     whole shell. Ring showed only "/init: line 40: can't create
+#     /dev/watchdog: No such device" then silence. Not ratelimit (0
+#     suppressed messages) - v19 died the same way.
 #
-# v20 changes vs v19:
-#   * NO set -x (that was the ratelimit killer)
-#   * klog() sleeps 1s after each write => max ~5 msgs/5s, safely under
-#     the 10-msgs/5s devkmsg burst limit
-#   * dropped the useless /dev/mem raw-marker writes (devmem was strict)
-#   * fewer, higher-value klogs; alive loop logs every 30s
+# v21 changes vs v20:
+#   * NO exec-with-device-redirect ANYWHERE (only `exec 2>/dev/kmsg`,
+#     guarded by [ -c /dev/kmsg ], which works - initbin pre-creates it)
+#   * watchdog: per-feed single write `printf 'F' > /dev/watchdog`
+#     (a failing command redirect only kills the command, not the shell)
+#   * mounts moved BEFORE first feed so the /proc/watchdog/ctrl fallback
+#     path is available immediately
+#   * klog spacing 1s kept (devkmsg budget 10 msgs/5s)
 #   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
-# ---------- early: kmsg channel + watchdog, before anything else ----------
+# ---------- kmsg channel first (initbin already created /dev/kmsg) ----------
 [ -e /dev/kmsg ] || mknod /dev/kmsg c 1 11 2>/dev/null
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V20] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V20] %s\n' "$1" > /tmp/v20.log 2>/dev/null
+	printf '[V21] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V21] %s\n' "$1" > /tmp/v21.log 2>/dev/null
 	sleep 1
 }
 
-[ -e /dev/watchdog ] || mknod /dev/watchdog c 10 130 2>/dev/null
+# ---------- mounts FIRST (feed fallback needs /proc) ----------
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm /tmp /var /var/run /var/log /root 2>/dev/null
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+mount -t tmpfs tmpfs /var/run 2>/dev/null
+
+# ---------- watchdog: per-feed single writes, no fd keeping ----------
 WOPEN=no
-if [ -c /dev/watchdog ]; then
-	exec 3>/dev/watchdog 2>/dev/null && WOPEN=yes
-fi
+WDNODE=no
+[ -e /dev/watchdog ] || mknod /dev/watchdog c 10 130 2>/dev/null
+[ -c /dev/watchdog ] && WDNODE=yes
 
 feed() {
-	if [ "$WOPEN" = "yes" ]; then
-		printf 'F' >&3 2>/dev/null && return 0
+	if [ "$WDNODE" = "yes" ] && printf 'F' > /dev/watchdog 2>/dev/null; then
+		return 0
 	fi
-	printf 'F' > /dev/watchdog 2>/dev/null && return 0
 	printf 'feeddog' > /proc/watchdog/ctrl 2>/dev/null && return 0
 	printf 'feeddog' > /proc/watchdog 2>/dev/null && return 0
 	return 1
 }
 
-feed && klog "watchdog fed ok (wopen=$WOPEN)" || klog "watchdog feed FAILED first try"
+# probe which path works (result logged, not relied upon)
+WDPATH=none
+if [ "$WDNODE" = "yes" ] && printf 'F' > /dev/watchdog 2>/dev/null; then
+	WDPATH=node
+elif printf 'feeddog' > /proc/watchdog/ctrl 2>/dev/null; then
+	WDPATH=proc_ctrl
+elif printf 'feeddog' > /proc/watchdog 2>/dev/null; then
+	WDPATH=proc_root
+fi
+klog "watchdog probe path=$WDPATH wdnodesys=$WDNODE"
 
 # background feeder: survives even if main flow stalls
 (
@@ -60,27 +76,19 @@ feed && klog "watchdog fed ok (wopen=$WOPEN)" || klog "watchdog feed FAILED firs
 	done
 ) &
 
-# ---------- mounts (same as v8/v19) ----------
-mount -t proc proc /proc 2>/dev/null
-mount -t sysfs sysfs /sys 2>/dev/null
-mount -t devtmpfs devtmpfs /dev 2>/dev/null
-mkdir -p /dev/pts /dev/shm /tmp /var /var/run /var/log /root 2>/dev/null
-mount -t devpts devpts /dev/pts 2>/dev/null
-mount -t tmpfs tmpfs /tmp 2>/dev/null
-mount -t tmpfs tmpfs /var/run 2>/dev/null
+klog "mounts done mtd=$(cut -d' ' -f1,3,4 /proc/mtd 2>/dev/null | tr '\n' '|')"
 
 # best-effort uart beacon (kernel has no usable console; harmless)
 for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
 	[ -c "$t" ] || continue
 	stty -F "$t" 115200 raw -echo 2>/dev/null
-	if printf '\r\n[V20] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
+	if printf '\r\n[V21] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
 		UART="$t"
 		break
 	fi
 done
 
 klog "start net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
-klog "mtd $(cut -d' ' -f1,3,4 /proc/mtd 2>/dev/null | tr '\n' '|')"
 
 ip link set lo up 2>/dev/null
 
