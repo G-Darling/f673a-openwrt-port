@@ -1,24 +1,22 @@
 #!/bin/sh
-# Bring-up init v12 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v13 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v12 = v11 baseline (verified 2026-11-27) + working remote shell.
-# Evidence from the v11 run:
-#   * ping 192.168.1.1 stayed UP for 5+ min -> kernel + network stack alive,
-#     LINKED path taken, board did NOT reboot
-#   * tcp/23 refused -> OpenWrt busybox has NO telnetd applet (verified in
-#     bin/busybox: string "telnetd" absent; applet table count 0)
-#   * rootfs HAS /usr/sbin/dropbear, /usr/bin/dropbearkey, /usr/bin/nc
-# So v12 starts dropbear (password auth, root/f673a2026) instead of telnetd,
-# with busybox nc fallbacks.
+# v12 finding (2026-11-27): board stable, ping OK, but ALL server ports
+# refused -> init hung somewhere between bring-up and the nc loops.
+# Prime suspect: `dropbearkey` blocking (first command after bring-up).
+# Fix strategy:
+#   1. start the nc:5555 boot.log dump server FIRST (remote diagnosis channel)
+#   2. host keys are PRE-BAKED in the image at CI build time (OpenSSH format,
+#      dropbear >=2020.79 reads them) -> no runtime keygen needed
+#   3. keygen only as fallback, wrapped in `timeout 60` (busybox timeout)
 #
-# HARD RULE: NEVER write to NAND.
-#   * host keys MUST be generated into /tmp, never /etc/dropbear
-#   * all state in tmpfs, root stays read-only
+# Remote access after boot (PC = 192.168.1.254):
+#   ssh root@192.168.1.1   (password f673a2026)  <- primary
+#   nc 192.168.1.1 23      (busybox nc shell fallback, if -e supported)
+#   nc 192.168.1.1 5555    (one-shot dump of /tmp/boot.log)
 #
-# Remote access after boot (PC on 192.168.1.254):
-#   ssh root@192.168.1.1        (password f673a2026)   <- primary
-#   nc 192.168.1.1 23           (busybox nc shell, if -e supported)
-#   nc 192.168.1.1 5555         (dumps /tmp/boot.log, one shot per connect)
+# HARD RULE: NEVER write to NAND. Root stays read-only; keys live in
+# /etc/dropbear (read-only use) or /tmp (fallback), never elsewhere.
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
@@ -35,7 +33,7 @@ mount -t tmpfs tmpfs /var/run 2>/dev/null
 for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
 	[ -c "$t" ] || continue
 	stty -F "$t" 115200 raw -echo 2>/dev/null
-	if printf '\r\n[V12] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
+	if printf '\r\n[V13] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
 		UART="$t"
 		break
 	fi
@@ -44,11 +42,11 @@ done
 L=/tmp/boot.log
 : > "$L"
 log() {
-	echo "[V12] $1" >> "$L"
-	[ -n "$UART" ] && printf '[V12] %s\r\n' "$1" > "$UART" 2>/dev/null
+	echo "[V13] $(cut -d' ' -f1 /proc/uptime 2>/dev/null) $1" >> "$L"
+	[ -n "$UART" ] && printf '[V13] %s\r\n' "$1" > "$UART" 2>/dev/null
 }
 
-log "start $(date 2>/dev/null)"
+log "start"
 log "ver $(cat /proc/version 2>/dev/null)"
 log "cmdline: $(cat /proc/cmdline 2>/dev/null)"
 log "netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
@@ -70,45 +68,49 @@ for n in /sys/class/net/*; do
 	sleep 1
 done
 
-# ---- remote shell servers ------------------------------------------------
-# primary: dropbear on 22. Keys in /tmp ONLY (NAND safety rule).
-KEY_ED=/tmp/dropbear_ed25519_host_key
-KEY_RSA=/tmp/dropbear_rsa_host_key
-if dropbearkey -t ed25519 -f "$KEY_ED" >>"$L" 2>&1; then
-	log "ed25519 key ok"
-else
-	rm -f "$KEY_ED"
-	log "ed25519 keygen FAILED"
-fi
-if dropbearkey -t rsa -s 2048 -f "$KEY_RSA" >>"$L" 2>&1; then
-	log "rsa key ok"
-else
-	rm -f "$KEY_RSA"
-	log "rsa keygen FAILED"
-fi
-DBR="/usr/sbin/dropbear -p 22"
-[ -s "$KEY_ED" ] && DBR="$DBR -r $KEY_ED"
-[ -s "$KEY_RSA" ] && DBR="$DBR -r $KEY_RSA"
-if $DBR >>"$L" 2>&1; then
-	log "dropbear 22 started"
-else
-	log "dropbear FAILED (rc=$?)"
+# ---- remote diagnosis channel FIRST (before anything that can hang) ------
+# one-shot dump of boot.log per connection; a while-loop keeps serving.
+(while :; do nc -l -p 5555 < "$L" >/dev/null 2>&1; sleep 1; done) </dev/null &
+log "nc log dump on 5555 started"
+
+# ---- dropbear on 22 ------------------------------------------------------
+# primary: pre-baked OpenSSH-format keys inside the image (read-only use)
+BKEYS=""
+for k in /etc/dropbear/dropbear_ed25519_host_key \
+         /etc/dropbear/dropbear_rsa_host_key; do
+	[ -s "$k" ] && BKEYS="$BKEYS -r $k"
+done
+if [ -n "$BKEYS" ]; then
+	log "baked keys present"
+	/usr/sbin/dropbear -p 22 $BKEYS </dev/null >>"$L" 2>&1 &&
+		log "dropbear 22 started (baked keys)" ||
+		log "dropbear with baked keys FAILED rc=$?"
 fi
 
-# fallback shell + log dump via busybox nc
+# fallback: runtime keygen, timeout-guarded, only if dropbear is not up
+if ! pidof dropbear >/dev/null 2>&1; then
+	log "fallback keygen (timeout 60 each)"
+	(
+		timeout 60 dropbearkey -t ed25519 -f /tmp/dk_ed25519 </dev/null >/dev/null 2>&1
+		timeout 60 dropbearkey -t rsa -s 2048 -f /tmp/dk_rsa </dev/null >/dev/null 2>&1
+		F=""
+		[ -s /tmp/dk_ed25519 ] && F="$F -r /tmp/dk_ed25519"
+		[ -s /tmp/dk_rsa ] && F="$F -r /tmp/dk_rsa"
+		[ -n "$F" ] && /usr/sbin/dropbear -p 22 $F </dev/null >/tmp/dbr.err 2>&1
+		echo done > /tmp/fb_done
+	) </dev/null &
+fi
+
+# ---- shell fallback via busybox nc ---------------------------------------
 if nc --help 2>&1 | grep -q -- '-e'; then
-	(while :; do nc -l -p 23 -e /bin/sh >/dev/null 2>&1; sleep 1; done) &
+	(while :; do nc -l -p 23 -e /bin/sh >/dev/null 2>&1; sleep 1; done) </dev/null &
 	log "nc shell fallback on 23"
 else
 	log "nc has no -e, shell fallback skipped"
 fi
-(while :; do nc -l -p 5555 < "$L" >/dev/null 2>&1; sleep 1; done) &
-log "nc log dump on 5555"
 
 # ---- stay alive ----------------------------------------------------------
-# v11 proved the board is stable; no warm-reboot fallback any more.
-# background heartbeat keeps ARP fresh and gives the PC side a liveness probe.
-(while :; do ping -c 1 -W 2 192.168.1.254 >/dev/null 2>&1; sleep 10; done) &
+(while :; do ping -c 1 -W 2 192.168.1.254 >/dev/null 2>&1; sleep 10; done) </dev/null &
 
 LINKED=""
 i=0
