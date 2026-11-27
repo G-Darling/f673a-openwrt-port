@@ -182,7 +182,7 @@ void _start(void) {
     /* 1. mounts: proc (independent of /dev) */
     rc = sys_mount("proc", "/proc", "proc", 0, 0);
     klen = 0;
-    klog_add("[INITBIN] v10 alive mount proc=");
+    klog_add("[INITBIN] v11 alive mount proc=");
     klog_num(rc);
 
     /* 2. writable /dev: tmpfs -> ramfs -> devtmpfs */
@@ -241,7 +241,7 @@ void _start(void) {
      * (warm reset, DRAM preserved) so the __log_buf with the full
      * [V19] trace can be mined from U-Boot. Board then cycles:
      * Linux ~60s + boot ~35s. Interrupt autoboot to mine. */
-#define REBOOT_SECONDS 210
+#define REBOOT_SECONDS 240
     for (i = 1; ; i++) {
         int st = 0;
         sys_nanosleep(3, 0);
