@@ -97,6 +97,16 @@ static long sys_klogctl(int type, char *buf, int len) { return sc3(SYS_KLOGCTL, 
 static long sys_mount(const char *src, const char *tgt, const char *fs, ulong fl, const void *d) {
     return sc5(SYS_MOUNT, (long)src, (long)tgt, (long)fs, (long)fl, (long)d);
 }
+/* klog: inject a line into the kernel printk ring via /dev/kmsg (minable!) */
+static void klog(const char *s) {
+    char buf[256];
+    long fd = sys_open("/dev/kmsg", 1);
+    int i = 0;
+    const char *p = s;
+    while (*p && i < 200) buf[i++] = *p++;
+    buf[i++] = '\n';
+    if (fd >= 0) { sys_write(fd, buf, i); sc1(SYS_CLOSE, fd); }
+}
 static long sys_nanosleep(long sec, long nsec) {
     long ts[2]; ts[0] = sec; ts[1] = nsec;
     return sc2(SYS_NANOSLEEP, (long)ts, 0);
@@ -122,6 +132,25 @@ static void puthex(ulong v) {
     for (k = 28; k >= 0; k -= 4) putc_(hx[(v >> k) & 0xf]);
 }
 static void report(const char *label, long v) { puts_(label); putdec(v); puts_("\r\n"); }
+/* append decimal of v to the last klog line: open+write appends? /dev/kmsg
+   writes are line-based, so use one-shot helper instead */
+static char kline[192];
+static int klen = 0;
+static void klog_add(const char *s) {
+    while (*s && klen < 180) kline[klen++] = *s++;
+}
+static void klog_num(long v) {
+    char b[16]; int i = 0; ulong u;
+    if (v < 0) { klog_add("-"); u = (ulong)(-v); } else u = (ulong)v;
+    if (!u) kline[klen++] = '0';
+    while (u) { b[i++] = (char)('0' + (u % 10)); u /= 10; }
+    while (i--) kline[klen++] = b[i];
+}
+static void klog_flush(void) {
+    kline[klen] = 0;
+    klog(kline);
+    klen = 0;
+}
 
 static void uart_init(void) {
     u32 ibrd = U_IBRD, fbrd = U_FBRD;
@@ -177,8 +206,9 @@ static void dump_kmsg_all(const char *title) {
     puts_("====end kmsg====\r\n");
 }
 
-/* ---- watchdog: two paths, never give up ---- */
+/* ---- watchdog: never give up ---- */
 static int wdt_fd = -1;
+static int wdt_ok_path = 0;
 static int feed_watchdog(void) {
     char c = 'F';
     char msg[8] = "feeddog";
@@ -187,21 +217,25 @@ static int feed_watchdog(void) {
         sc1(SYS_CLOSE, wdt_fd);
         wdt_fd = -1;
     }
-    if (wdt_fd < 0)
-        wdt_fd = (int)sys_open("/dev/watchdog", 1 /* O_WRONLY */);
+    if (wdt_fd < 0) {
+        wdt_fd = (int)sys_open("/dev/watchdog", 1);
+        if (wdt_fd < 0) wdt_fd = (int)sys_open("/dev/zx_wdt", 1);
+    }
     if (wdt_fd >= 0 && sys_write(wdt_fd, &c, 1) == 1) return 0;
     {
-        long fd = sys_open("/proc/watchdog/ctrl", 1);
-        if (fd >= 0) {
-            sys_write(fd, msg, 7);
-            sc1(SYS_CLOSE, fd);
-            return 0;
-        }
-        fd = sys_open("/proc/watchdog", 1);
-        if (fd >= 0) {
-            sys_write(fd, msg, 7);
-            sc1(SYS_CLOSE, fd);
-            return 0;
+        const char *paths[3];
+        long fd; int k;
+        paths[0] = "/proc/watchdog/ctrl";
+        paths[1] = "/proc/zx_wdt/ctrl";
+        paths[2] = "/proc/watchdog";
+        for (k = 0; k < 3; k++) {
+            fd = sys_open(paths[k], 1);
+            if (fd >= 0) {
+                sys_write(fd, msg, 7);
+                sc1(SYS_CLOSE, fd);
+                if (wdt_ok_path == 0) wdt_ok_path = k + 1;
+                return 0;
+            }
         }
     }
     return -1;
@@ -214,7 +248,20 @@ static void spawn_init(void) {
         static char *argv[] = {"/bin/sh", "/init", 0};
         static char *envp[] = {"PATH=/sbin:/bin:/usr/sbin:/usr/bin",
                                "HOME=/", "TERM=linux", 0};
-        sc3(SYS_EXECVE, (long)"/bin/sh", (long)argv, (long)envp);
+        {
+            long rc = sc3(SYS_EXECVE, (long)"/bin/sh", (long)argv, (long)envp);
+            char b2[96];
+            int bi = 0;
+            const char *m = "[INITBIN] exec /bin/sh rc=";
+            while (*m) b2[bi++] = *m++;
+            { long v = rc; char d[12]; int di = 0; ulong u;
+              if (v < 0) { b2[bi++]='-'; u=(ulong)(-v);} else u=(ulong)v;
+              if (!u) b2[bi++]='0';
+              while (u) { d[di++]=(char)('0'+(u%10)); u/=10; }
+              while (di--) b2[bi++]=d[di]; }
+            b2[bi]=0;
+            klog(b2);
+        }
         sc1(SYS_EXIT_GROUP, 9);   /* child only */
     }
     puts_("[INITBIN] spawned /init pid=");
@@ -226,13 +273,20 @@ void _start(void) {
     int i;
     uart_probe();
     uart_init();
-    puts_("\r\n\r\n[INITBIN] v2 ALIVE (static PID1: uart + kmsg + wdt + /init)\r\n");
+    puts_("\r\n\r\n[INITBIN] v3 ALIVE (static PID1: uart + kmsg + wdt + /init)\r\n");
+    klog("[INITBIN] v3 ALIVE pid1 running");
     dump_kmsg_all("KERNEL LOG (boot)");
 
-    sys_mount("devtmpfs", "/dev", "devtmpfs", 0, 0);
-    sys_mount("proc", "/proc", "proc", 0, 0);
-    sys_mount("sysfs", "/sys", "sysfs", 0, 0);
-    puts_("[INITBIN] mounts done\r\n");
+    {
+        long rc1 = sys_mount("devtmpfs", "/dev", "devtmpfs", 0, 0);
+        long rc2 = sys_mount("proc", "/proc", "proc", 0, 0);
+        long rc3 = sys_mount("sysfs", "/sys", "sysfs", 0, 0);
+        puts_("[INITBIN] mounts done\r\n");
+        klog_add("[INITBIN] mounts rc dev=");
+        klog_num(rc1); klog_add(" proc="); klog_num(rc2);
+        klog_add(" sys="); klog_num(rc3);
+        klog_flush();
+    }
 
     spawn_init();
 
@@ -247,6 +301,11 @@ void _start(void) {
             puts_("[INITBIN] alive t=");
             putdec((i - 1) * 3);
             puts_("s wdt=ok\r\n");
+            klog_add("[INITBIN] alive t=");
+            klog_num((i - 1) * 3);
+            klog_add("s wdt_path=");
+            klog_num(wdt_ok_path);
+            klog_flush();
         }
         /* reap exited children, WNOHANG=1: wait4(-1, &st, 1, 0) */
         for (;;) {
