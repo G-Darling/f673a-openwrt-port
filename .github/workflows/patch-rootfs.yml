@@ -192,7 +192,7 @@ jobs:
           sudo cp netshell rf/usr/sbin/netshell
           sudo chmod 755 rf/usr/sbin/netshell
 
-      - name: Build initbin (static PID1: UART + kmsg + watchdog + spawn /init)
+      - name: "Build initbin (static PID1 - UART + kmsg + watchdog + spawn /init)"
         run: |
           set -e
           arm-linux-gnueabi-gcc -march=armv7-a -marm -mfloat-abi=soft -O2 \
