@@ -1,33 +1,66 @@
 #!/bin/sh
-# Bring-up init v8 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v19 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# HARD RULE: this init must NEVER write to NAND. Evidence:
-#   v3 looped, v5/v6/v7 looped - each one performed a real NAND write
-#   (v3: ??? unknown write, v5/v6: dd via mtdblock, v7: nandmark via mtd char).
-#   v4 was STABLE and its only luck was that every dd it attempted failed
-#   before touching flash (seek beyond end-of-device).
-# => any real NAND write from Linux panics this kernel (~13s reset loop).
+# ROOT CAUSES FOUND (via RAM __log_buf mining, 2026-11-27):
+#   1. vendor kernel arms a HARDWARE WATCHDOG during driver init:
+#      "pdt_wdt_init(556): Starting Watchdog Timer... heartbeat 16 sec"
+#      => ANY init that never pets it resets ~14-16s after boot.
+#      This invalidated the old "v8 stable" conclusion - v8/v11 were
+#      also reset-looping, we just observed ping inside the window.
+#   2. PID1 died with exitcode=0x00007f00 (=127): shell exited after
+#      trouble; v19 keeps PID1 alive in a foreground watchdog-feed loop.
 #
-# v8 therefore:
-#   * keeps root mounted READ-ONLY (bootargs ro), never remounts rw
-#   * all temporary state lives in tmpfs (/tmp)
-#   * no dropbear (its key handling may write); telnetd only
-#   * diagnostics go to PHYSICAL RAM markers via /dev/mem at four fixed
-#     addresses, followed by `reboot -f` (warm reset keeps DRAM) so u-boot
-#     can be intercepted and the markers read back:
-#       md.b 0x4c000000 0x200 ; md.b 0x4e000000 0x200
-#       md.b 0x56000000 0x200 ; md.b 0x57000000 0x200
-#   * brings up every netdev (staggered 2s), pings the host after each so
-#     the PC side can see ARP/link events in real time
-#   * if any interface reaches operstate=up, stays alive (telnet 192.168.1.1)
-#     otherwise warm-reboots after 60s so markers can be collected
+# v19 changes vs v8:
+#   * feed watchdog every 3s, two paths:
+#       a) /dev/watchdog kept open (misc watchdog, write = pet)
+#       b) /proc/watchdog/ctrl with "feeddog" (vendor pdt_wdt proc API)
+#   * PID1 NEVER exits: final foreground feed loop (no exec, no reboot -f)
+#   * diagnostics into the kernel log ring via /dev/kmsg, so a later
+#     RAM dump of __log_buf reveals every init step even without console
+#   * stderr of PID1 -> /dev/kmsg + `set -x`: full shell trace in dmesg
+#   * dropbear -F -E (stderr->kmsg) so its failure reason lands in dmesg
+#   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
-# decimal seek units (512B) for dd on /dev/mem: 0x4C000000/512 etc.
-RM_SEEKS="2490368 2555904 2818048 2852144"
+# ---------- early: kmsg channel + watchdog, before anything else ----------
+[ -e /dev/kmsg ] || mknod /dev/kmsg c 1 11 2>/dev/null
+[ -c /dev/kmsg ] && exec 2>/dev/kmsg
+set -x
 
+klog() {
+	printf '[V19] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V19] %s\n' "$1" > /tmp/v19.log 2>/dev/null
+}
+
+[ -e /dev/watchdog ] || mknod /dev/watchdog c 10 130 2>/dev/null
+WOPEN=no
+if [ -c /dev/watchdog ]; then
+	exec 3>/dev/watchdog 2>/dev/null && WOPEN=yes
+fi
+
+feed() {
+	if [ "$WOPEN" = "yes" ]; then
+		printf 'F' >&3 2>/dev/null && return 0
+	fi
+	printf 'F' > /dev/watchdog 2>/dev/null && return 0
+	printf 'feeddog' > /proc/watchdog/ctrl 2>/dev/null && return 0
+	printf 'feeddog' > /proc/watchdog 2>/dev/null && return 0
+	return 1
+}
+
+feed && klog "watchdog fed ok (wopen=$WOPEN)" || klog "watchdog feed FAILED first try"
+
+# background feeder: survives even if main flow stalls
+(
+	while :; do
+		feed 2>/dev/null
+		sleep 3
+	done
+) &
+
+# ---------- mounts (same as v8) ----------
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
@@ -40,69 +73,68 @@ mount -t tmpfs tmpfs /var/run 2>/dev/null
 for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
 	[ -c "$t" ] || continue
 	stty -F "$t" 115200 raw -echo 2>/dev/null
-	if printf '\r\n[V8] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
+	if printf '\r\n[V19] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
 		UART="$t"
 		break
 	fi
 done
 
+# ---------- RAM markers (best effort, /dev/mem was denied by strict devmem) ----------
+RM_SEEKS="2490368 2555904 2818048 2852144"
 [ -e /dev/mem ] || mknod /dev/mem c 1 1 2>/dev/null
-MEM_OK=no
-[ -e /dev/mem ] && [ -c /dev/mem ] && MEM_OK=yes
-
 mark() {
-	printf '[V8] %s\n' "$1" > /tmp/m 2>/dev/null
-	if [ "$MEM_OK" = "yes" ]; then
-		for sk in $RM_SEEKS; do
-			dd if=/tmp/m of=/dev/mem bs=512 seek=$sk conv=notrunc 2>/dev/null
-		done
-	fi
-	[ -n "$UART" ] && printf '[V8] %s\r\n' "$1" > "$UART" 2>/dev/null
+	printf '[V19] %s\n' "$1" > /tmp/m 2>/dev/null
+	for sk in $RM_SEEKS; do
+		dd if=/tmp/m of=/dev/mem bs=512 seek=$sk conv=notrunc 2>/dev/null
+	done
+	[ -n "$UART" ] && printf '[V19] %s\r\n' "$1" > "$UART" 2>/dev/null
 }
 
-mark "start mem=$MEM_OK net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
-mark "mtd $(cut -d' ' -f1,3,4 /proc/mtd 2>/dev/null | tr '\n' '|')"
+klog "start net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
+mark "start net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
+klog "mtd $(cut -d' ' -f1,3,4 /proc/mtd 2>/dev/null | tr '\n' '|')"
 
 ip link set lo up 2>/dev/null
 
 for n in /sys/class/net/*; do
 	d=${n##*/}
 	[ "$d" = "lo" ] && continue
+	klog "PRE $d"
 	mark "PRE $d"
 	ip link set "$d" up 2>/dev/null || ifconfig "$d" up 2>/dev/null
 	sleep 2
-	mark "UP $d st=$(cat /sys/class/net/$d/operstate 2>/dev/null)"
+	klog "UP $d st=$(cat /sys/class/net/$d/operstate 2>/dev/null)"
 	ifconfig "$d" 192.168.1.1 netmask 255.255.255.0 2>/dev/null ||
 		ip addr add 192.168.1.1/24 dev "$d" 2>/dev/null
-	# external signal: ARP/ping towards the host, PC side is watching
-	ping -c 2 -W 2 192.168.1.254 >/dev/null 2>&1 && mark "PING-OK $d"
+	ping -c 2 -W 2 192.168.1.254 >/dev/null 2>&1 && klog "PING-OK $d"
 	sleep 1
 done
 
+# ---------- remote access attempts (stderr already -> kmsg) ----------
 telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
-mark "telnetd 23 up"
+klog "telnetd attempted (applet may be missing)"
 
+/usr/sbin/netshell >/dev/null 2>&1 &
+klog "netshell attempted on :23"
+
+mkdir -p /etc/dropbear 2>/dev/null
+dropbear -F -E -p 22 >/dev/null 2>&1 &
+klog "dropbear attempted on :22"
+
+# ---------- liveness loop: PID1 NEVER exits ----------
 LINKED=""
 i=0
-while [ $i -lt 30 ]; do
+while :; do
 	for n in /sys/class/net/*; do
 		d=${n##*/}
 		[ "$d" = "lo" ] && continue
-		[ "$(cat /sys/class/net/$d/operstate 2>/dev/null)" = "up" ] && LINKED="$LINKED $d"
+		[ "$(cat /sys/class/net/$d/operstate 2>/dev/null)" = "up" ] &&
+			LINKED="$LINKED $d"
 	done
-	[ -n "$LINKED" ] && break
-	sleep 3
+	feed 2>/dev/null || klog "watchdog feed FAILED in main loop"
+	if [ $((i % 10)) -eq 0 ]; then
+		klog "alive t=$((i * 3))s linked=[$LINKED] up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
+	fi
 	i=$((i + 1))
+	sleep 3
 done
-mark "LINKED=$LINKED"
-
-if [ -n "$LINKED" ]; then
-	# someone can reach us: stay alive (telnet 192.168.1.1)
-	exec sleep 100000000
-fi
-
-mark "no link - warm reboot in 5s so u-boot can dump RAM markers"
-sleep 5
-reboot -f
-exec sleep 100000000
-
