@@ -1,23 +1,25 @@
 #!/bin/sh
-# Bring-up init v21 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v22 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v20 board-test results (2026-11-27, via __log_buf mining of initbin v9):
-#   * initbin v9 PROVEN: alive t=0s/t=120s, wdt_path=2 proc feed OK,
-#     diag reboot at 150s -> warm reset, DRAM ring intact. Toolchain closed.
-#   * /init DIED AT LINE 40: "exec 3>/dev/watchdog" - POSIX rule: in a
-#     non-interactive shell, `exec` with a FAILING redirection EXITS the
-#     whole shell. Ring showed only "/init: line 40: can't create
-#     /dev/watchdog: No such device" then silence. Not ratelimit (0
-#     suppressed messages) - v19 died the same way.
+# v21 board-test results (2026-11-27, __log_buf mining of initbin v10):
+#   * FULL [V21] sequence landed: watchdog probe path=proc_ctrl, mounts
+#     done, start net=ip6tnl0,lo,pon0,sit0, PRE/UP for each netdev,
+#     telnetd/netshell/dropbear attempted, liveness loop alive 0-120s.
+#   * **NO ETHERNET NIC IN KERNEL**: /sys/class/net only has virtual
+#     interfaces (ip6tnl0, lo, pon0, sit0). The onboard 2.5GbE driver is
+#     a LOADABLE MODULE in vendor land, not built-in.
+#   * Kernel strings reveal the mechanism: "/kmoduletmp/kmodule.img",
+#     "open kmodule.img failed!", "mount loop0" - vendor kernel mounts a
+#     kmodule.img (loop) holding all .ko files.
+#   * Our root is mtd13 (31:13) => mtd12 "rootfs1" likely still holds the
+#     ORIGINAL vendor rootfs; osgi1/osgi2 hold vendor app fs. Vendor
+#     kernel natively supports those filesystems.
 #
-# v21 changes vs v20:
-#   * NO exec-with-device-redirect ANYWHERE (only `exec 2>/dev/kmsg`,
-#     guarded by [ -c /dev/kmsg ], which works - initbin pre-creates it)
-#   * watchdog: per-feed single write `printf 'F' > /dev/watchdog`
-#     (a failing command redirect only kills the command, not the shell)
-#   * mounts moved BEFORE first feed so the /proc/watchdog/ctrl fallback
-#     path is available immediately
-#   * klog spacing 1s kept (devkmsg budget 10 msgs/5s)
+# v22 changes vs v21:
+#   * mount vendor partitions (mtdblock12 rootfs1, mtdblock9 osgi1),
+#     find kmodule.img, loop-mount it, insmod ALL .ko (klog failures),
+#     then re-list /sys/class/net - the ethernet hunt in one shot.
+#   * no exec-with-device-redirect (v21 lesson), klog spaced 1s (v21)
 #   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
@@ -28,8 +30,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V21] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V21] %s\n' "$1" > /tmp/v21.log 2>/dev/null
+	printf '[V22] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V22] %s\n' "$1" > /tmp/v22.log 2>/dev/null
 	sleep 1
 }
 
@@ -57,7 +59,6 @@ feed() {
 	return 1
 }
 
-# probe which path works (result logged, not relied upon)
 WDPATH=none
 if [ "$WDNODE" = "yes" ] && printf 'F' > /dev/watchdog 2>/dev/null; then
 	WDPATH=node
@@ -66,7 +67,7 @@ elif printf 'feeddog' > /proc/watchdog/ctrl 2>/dev/null; then
 elif printf 'feeddog' > /proc/watchdog 2>/dev/null; then
 	WDPATH=proc_root
 fi
-klog "watchdog probe path=$WDPATH wdnodesys=$WDNODE"
+klog "watchdog probe path=$WDPATH"
 
 # background feeder: survives even if main flow stalls
 (
@@ -78,20 +79,64 @@ klog "watchdog probe path=$WDPATH wdnodesys=$WDNODE"
 
 klog "mounts done mtd=$(cut -d' ' -f1,3,4 /proc/mtd 2>/dev/null | tr '\n' '|')"
 
-# best-effort uart beacon (kernel has no usable console; harmless)
-for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
-	[ -c "$t" ] || continue
-	stty -F "$t" 115200 raw -echo 2>/dev/null
-	if printf '\r\n[V21] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
-		UART="$t"
-		break
-	fi
+# ---------- ethernet hunt: vendor rootfs -> kmodule.img -> insmod ----------
+mkdir -p /mnt/a /mnt/b /mnt/c /mnt/kmod
+
+# mtdblock nodes (devtmpfs usually makes them; mknod fallback major 31)
+for i in 9 10 12 13; do
+	[ -b /dev/mtdblock$i ] || mknod /dev/mtdblock$i b 31 $i 2>/dev/null
 done
 
-klog "start net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
+mount_one() { # <mtdblock> <mnt> : try jffs2 then squashfs
+	mount -t jffs2 "/dev/mtdblock$1" "$2" 2>/dev/null && return 0
+	mount -t squashfs "/dev/mtdblock$1" "$2" 2>/dev/null && return 0
+	mount -t cramfs "/dev/mtdblock$1" "$2" 2>/dev/null && return 0
+	return 1
+}
 
+VSRC=""
+mount_one 12 /mnt/a && VSRC=mtd12 || klog "mtd12 mount failed"
+[ -n "$VSRC" ] || { mount_one 9 /mnt/a && VSRC=mtd9 || klog "mtd9 mount failed"; }
+[ -n "$VSRC" ] || { mount_one 10 /mnt/a && VSRC=mtd10 || klog "mtd10 mount failed"; }
+klog "vendor fs src=$VSRC"
+
+KMI=""
+if [ -n "$VSRC" ]; then
+	find /mnt/a -maxdepth 4 -name 'kmodule*.img' > /tmp/kmi 2>/dev/null
+	KMI=$(head -1 /tmp/kmi 2>/dev/null)
+	klog "kmodule.img=[$KMI] toplevel=$(ls /mnt/a 2>/dev/null | tr '\n' ',')"
+fi
+
+KMNTED=0
+KOUNT=$(find /mnt/kmod -name '*.ko' 2>/dev/null | wc -l)
+if [ -n "$KMI" ] && [ "$KOUNT" = "0" ]; then
+	if mount -o loop -t squashfs "$KMI" /mnt/kmod 2>/dev/null; then
+		KMNTED=1
+	elif mount -o loop -t cramfs "$KMI" /mnt/kmod 2>/dev/null; then
+		KMNTED=1
+	elif mount -o loop -t jffs2 "$KMI" /mnt/kmod 2>/dev/null; then
+		KMNTED=1
+	fi
+	klog "kmodule.img mount rc=$KMNTED"
+fi
+
+KOUNT=$(find /mnt/kmod -name '*.ko' 2>/dev/null | wc -l)
+klog "ko count=$KOUNT"
+
+if [ "$KOUNT" != "0" ]; then
+	# insmod ALL vendor modules in find order (vendor kloader does the
+	# same); log only failures to stay inside the kmsg budget
+	FAILS=""
+	for f in $(find /mnt/kmod -name '*.ko' 2>/dev/null); do
+		insmod "$f" 2>/dev/null || FAILS="$FAILS ${f##*/}"
+	done
+	klog "insmod fails=[$FAILS]"
+fi
+
+klog "after-insmod net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
+
+# ---------- bring up whatever appeared (eth/mii candidates) ----------
 ip link set lo up 2>/dev/null
-
 for n in /sys/class/net/*; do
 	d=${n##*/}
 	[ "$d" = "lo" ] && continue
@@ -106,7 +151,7 @@ done
 
 # ---------- remote access attempts (stderr already -> kmsg) ----------
 telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
-klog "telnetd attempted (applet may be missing)"
+klog "telnetd attempted"
 
 /usr/sbin/netshell >/dev/null 2>&1 &
 klog "netshell attempted on :23"
