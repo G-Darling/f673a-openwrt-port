@@ -269,23 +269,43 @@ static void spawn_init(void) {
     puts_("\r\n");
 }
 
+/* ---- mknod via syscall 14 (ARM EABI legacy table) ---- */
+#define SYS_MKNOD 14
+static long sys_mknod(const char *p, int mode, int dev) {
+    return sc3(SYS_MKNOD, (long)p, mode, dev);
+}
+
 void _start(void) {
     int i;
     uart_probe();
     uart_init();
-    puts_("\r\n\r\n[INITBIN] v3 ALIVE (static PID1: uart + kmsg + wdt + /init)\r\n");
-    klog("[INITBIN] v3 ALIVE pid1 running");
-    dump_kmsg_all("KERNEL LOG (boot)");
+    puts_("\r\n\r\n[INITBIN] v4 ALIVE\r\n");
 
     {
-        long rc1 = sys_mount("devtmpfs", "/dev", "devtmpfs", 0, 0);
-        long rc2 = sys_mount("proc", "/proc", "proc", 0, 0);
-        long rc3 = sys_mount("sysfs", "/sys", "sysfs", 0, 0);
-        puts_("[INITBIN] mounts done\r\n");
-        klog_add("[INITBIN] mounts rc dev=");
-        klog_num(rc1); klog_add(" proc="); klog_num(rc2);
-        klog_add(" sys="); klog_num(rc3);
+        long rc1 = sys_mount("proc", "/proc", "proc", 0, 0);
+        long rc2 = sys_mount("sysfs", "/sys", "sysfs", 0, 0);
+        long rc3 = sys_mount("tmpfs", "/dev", "tmpfs", 0, 0);
+        /* /dev is now a writable tmpfs: create the nodes we need */
+        sys_mknod("/dev/kmsg", 0x20 | 0600, 0x0b0001);      /* c 1:11 */
+        sys_mknod("/dev/null", 0x20 | 0666, 0x010003);      /* c 1:3  */
+        sys_mknod("/dev/console", 0x20 | 0600, 0x050001);   /* c 5:1  */
+        sys_mknod("/dev/watchdog", 0x20 | 0600, 0x0a0082);  /* c 10:130 */
+        sys_mknod("/dev/mem", 0x20 | 0600, 0x010001);       /* c 1:1  */
+        /* now /dev/kmsg exists regardless of devtmpfs support */
+        klog_add("[INITBIN] v4 alive proc=");
+        klog_num(rc1); klog_add(" sys="); klog_num(rc2);
+        klog_add(" dev="); klog_num(rc3);
         klog_flush();
+        klog("[INITBIN] /dev/kmsg node created - this line proves the channel");
+    }
+
+    dump_kmsg_all("KERNEL LOG (boot)");
+
+    /* watchdog: /dev/watchdog (misc 10:130) + proc paths */
+    if (feed_watchdog() == 0) {
+        klog("[INITBIN] watchdog feed OK first try");
+    } else {
+        klog("[INITBIN] watchdog feed FAILED first try");
     }
 
     spawn_init();
@@ -294,31 +314,27 @@ void _start(void) {
         int st = 0;
         sys_nanosleep(3, 0);
         if (feed_watchdog() != 0) {
-            puts_("[INITBIN] WATCHDOG FEED FAILED t=");
-            putdec(i * 3);
-            puts_("s\r\n");
+            if ((i % 10) == 0) klog("[INITBIN] WATCHDOG FEED FAILED (repeat)");
         } else if ((i % 40) == 1) {
-            puts_("[INITBIN] alive t=");
-            putdec((i - 1) * 3);
-            puts_("s wdt=ok\r\n");
             klog_add("[INITBIN] alive t=");
             klog_num((i - 1) * 3);
             klog_add("s wdt_path=");
             klog_num(wdt_ok_path);
             klog_flush();
         }
-        /* reap exited children, WNOHANG=1: wait4(-1, &st, 1, 0) */
         for (;;) {
             long r = sc4(SYS_WAIT4, -1, (long)&st, 1, 0);
             if (r <= 0) break;
-            puts_("[INITBIN] child pid=");
-            putdec(r);
-            puts_(" exited status=0x");
-            puthex((ulong)st);
-            puts_(" -> respawning /init\r\n");
+            klog_add("[INITBIN] child pid=");
+            klog_num(r);
+            klog_add(" status=0x");
+            { ulong u = (ulong)st; const char *hx = "0123456789abcdef"; int k;
+              for (k = 28; k >= 0; k -= 4) putc_(hx[(u >> k) & 0xf]); }
+            klog_add(" -> respawn /init");
+            klog_flush();
             spawn_init();
         }
         if ((i % 2) == 0)
-            dump_kmsg_new();     /* mirror fresh kmsg (script trace) to UART */
+            dump_kmsg_new();
     }
 }
