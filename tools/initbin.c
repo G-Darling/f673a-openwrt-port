@@ -279,12 +279,16 @@ void _start(void) {
     int i;
     uart_probe();
     uart_init();
-    puts_("\r\n\r\n[INITBIN] v4 ALIVE\r\n");
+    puts_("\r\n\r\n[INITBIN] v5 ALIVE\r\n");
 
     {
         long rc1 = sys_mount("proc", "/proc", "proc", 0, 0);
         long rc2 = sys_mount("sysfs", "/sys", "sysfs", 0, 0);
         long rc3 = sys_mount("tmpfs", "/dev", "tmpfs", 0, 0);
+        if (rc3 != 0)
+            rc3 = sys_mount("ramfs", "/dev", "ramfs", 0, 0);   /* ramfs is always built-in */
+        if (rc3 != 0)
+            rc3 = sys_mount("devtmpfs", "/dev", "devtmpfs", 0, 0);
         /* /dev is now a writable tmpfs: create the nodes we need */
         sys_mknod("/dev/kmsg", 0x2000 | 0600, (1 << 8) | 11);     /* chr 1:11 */
         sys_mknod("/dev/null", 0x2000 | 0666, (1 << 8) | 3);      /* chr 1:3  */
@@ -292,11 +296,20 @@ void _start(void) {
         sys_mknod("/dev/watchdog", 0x2000 | 0600, (10 << 8) | 130); /* chr 10:130 */
         sys_mknod("/dev/mem", 0x2000 | 0600, (1 << 8) | 1);       /* chr 1:1  */
         /* now /dev/kmsg exists regardless of devtmpfs support */
-        klog_add("[INITBIN] v4 alive proc=");
+        klog_add("[INITBIN] v5 alive proc=");
         klog_num(rc1); klog_add(" sys="); klog_num(rc2);
         klog_add(" dev="); klog_num(rc3);
         klog_flush();
-        klog("[INITBIN] /dev/kmsg node created - this line proves the channel");
+        /* if /dev/kmsg still missing, try mknod again + report via sysfs? just retry */
+        {
+            long fd = sys_open("/dev/kmsg", 1);
+            if (fd < 0) {
+                sys_mknod("/dev/kmsg", 0x2000 | 0622, (1 << 8) | 11);
+                fd = sys_open("/dev/kmsg", 1);
+            }
+            if (fd >= 0) sc1(SYS_CLOSE, fd);
+        }
+        klog("[INITBIN] kmsg channel check (this line = channel works)");
     }
 
     dump_kmsg_all("KERNEL LOG (boot)");
