@@ -1,19 +1,32 @@
 #!/bin/sh
-# Bring-up init v17 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v8 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v16 still had ALL TCP ports refused while ping worked. Root cause unknown
-# because every log channel is dead. v17 adds PINGABLE STAGE MARKERS:
-# extra IPs are added on the mii netdev at each successful stage, so the PC
-# can determine exactly how far PID1 got with plain ping probes:
-#   192.168.1.77 -> PID1 (our init) is running
-#   192.168.1.78 -> netshell is UP (netstat showed :23 listener)
-#   192.168.1.79 -> dropbear is UP (netstat showed :22 listener)
-# Also logs `netstat -lnt` into /tmp/boot.log.
+# HARD RULE: this init must NEVER write to NAND. Evidence:
+#   v3 looped, v5/v6/v7 looped - each one performed a real NAND write
+#   (v3: ??? unknown write, v5/v6: dd via mtdblock, v7: nandmark via mtd char).
+#   v4 was STABLE and its only luck was that every dd it attempted failed
+#   before touching flash (seek beyond end-of-device).
+# => any real NAND write from Linux panics this kernel (~13s reset loop).
 #
-# HARD RULE: NEVER write to NAND. Root stays read-only.
+# v8 therefore:
+#   * keeps root mounted READ-ONLY (bootargs ro), never remounts rw
+#   * all temporary state lives in tmpfs (/tmp)
+#   * no dropbear (its key handling may write); telnetd only
+#   * diagnostics go to PHYSICAL RAM markers via /dev/mem at four fixed
+#     addresses, followed by `reboot -f` (warm reset keeps DRAM) so u-boot
+#     can be intercepted and the markers read back:
+#       md.b 0x4c000000 0x200 ; md.b 0x4e000000 0x200
+#       md.b 0x56000000 0x200 ; md.b 0x57000000 0x200
+#   * brings up every netdev (staggered 2s), pings the host after each so
+#     the PC side can see ARP/link events in real time
+#   * if any interface reaches operstate=up, stays alive (telnet 192.168.1.1)
+#     otherwise warm-reboots after 60s so markers can be collected
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
+
+# decimal seek units (512B) for dd on /dev/mem: 0x4C000000/512 etc.
+RM_SEEKS="2490368 2555904 2818048 2852144"
 
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
@@ -23,122 +36,51 @@ mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
 
-L=/tmp/boot.log
-: > "$L"
-log() {
-	echo "[V17] $(cut -d' ' -f1 /proc/uptime 2>/dev/null) $1" >> "$L"
-}
-
-# add $1 as secondary IP on every safe (non-eth, non-lo) netdev
-stage() {
-	for n in /sys/class/net/*; do
-		d=${n##*/}
-		case "$d" in lo|eth*) continue ;; esac
-		ip addr add "$1"/24 dev "$d" 2>/dev/null
-	done
-}
-
-# STAGE 77: init is alive
-stage 192.168.1.77
-log "stage77 marked"
-
-log "start"
-log "ver $(cat /proc/version 2>/dev/null)"
-log "cmdline: $(cat /proc/cmdline 2>/dev/null)"
-log "netdevs: $(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
-log "urandom: $(ls -l /dev/urandom 2>&1 | head -1)"
-log "dropbear keys: $(ls /etc/dropbear/ 2>&1 | tr '\n' ' ')"
-
-# ---- UART beacon: background only -----------------------------------------
-(
-	for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
-		[ -c "$t" ] || continue
-		timeout 3 stty -F "$t" 115200 raw -echo >/dev/null 2>&1 || continue
-		timeout 3 sh -c "printf '\r\n[V17] alive on $t\r\n' > $t" >/dev/null 2>&1 || continue
-		echo "$t" > /tmp/uart_beacon_dev
+# best-effort uart beacon (kernel has no usable console; harmless)
+for t in /dev/ttyS0 /dev/ttyAMA0 /dev/ttyS1 /dev/ttyPS0; do
+	[ -c "$t" ] || continue
+	stty -F "$t" 115200 raw -echo 2>/dev/null
+	if printf '\r\n[V8] alive on %s\r\n' "$t" > "$t" 2>/dev/null; then
+		UART="$t"
 		break
-	done
-) </dev/null &
-
-# ---- netshell: no-libc static TCP shell server on 23 ----------------------
-if [ -x /usr/sbin/netshell ]; then
-	/usr/sbin/netshell </dev/null >>"$L" 2>&1 &
-	log "netshell started (pid wait 1s)"
-else
-	log "netshell MISSING"
-fi
-sleep 2
-log "netstat after netshell:"
-netstat -lnt >> "$L" 2>&1
-if netstat -lnt 2>/dev/null | grep -q ':23 '; then
-	stage 192.168.1.78
-	log "STAGE78: :23 listener present"
-else
-	log "STAGE78 ABSENT: no :23 listener"
-fi
-
-# ---- dropbear on 22 (baked OpenSSH keys) ----------------------------------
-BKEYS=""
-for k in /etc/dropbear/dropbear_ed25519_host_key \
-         /etc/dropbear/dropbear_rsa_host_key; do
-	[ -s "$k" ] && BKEYS="$BKEYS -r $k"
+	fi
 done
-if [ -n "$BKEYS" ]; then
-	/usr/sbin/dropbear -p 22 $BKEYS </dev/null >>"$L" 2>&1 &&
-		log "dropbear 22 started (baked keys)" ||
-		log "dropbear baked-keys start FAILED rc=$?"
-fi
-sleep 2
-if netstat -lnt 2>/dev/null | grep -q ':22 '; then
-	stage 192.168.1.79
-	log "STAGE79: :22 listener present"
-else
-	log "STAGE79 ABSENT: no :22 listener"
-fi
 
-# fallback: runtime keygen, timeout-guarded, background
-if ! pidof dropbear >/dev/null 2>&1; then
-	(
-		timeout 60 dropbearkey -t ed25519 -f /tmp/dk_ed25519 </dev/null >/tmp/dk_ed.err 2>&1
-		timeout 60 dropbearkey -t rsa -s 2048 -f /tmp/dk_rsa </dev/null >/tmp/dk_rsa.err 2>&1
-		F=""
-		[ -s /tmp/dk_ed25519 ] && F="$F -r /tmp/dk_ed25519"
-		[ -s /tmp/dk_rsa ] && F="$F -r /tmp/dk_rsa"
-		[ -n "$F" ] && /usr/sbin/dropbear -p 22 $F </dev/null >>"$L" 2>&1
-		if netstat -lnt 2>/dev/null | grep -q ':22 '; then
-			ip addr add 192.168.1.80/24 dev mii0 2>/dev/null
-		fi
-		echo done > /tmp/fb_done
-	) </dev/null &
-	log "fallback keygen dispatched (background)"
-fi
+[ -e /dev/mem ] || mknod /dev/mem c 1 1 2>/dev/null
+MEM_OK=no
+[ -e /dev/mem ] && [ -c /dev/mem ] && MEM_OK=yes
 
-# ---- netdev bring-up (timeout-guarded; NEVER touch eth*) ------------------
+mark() {
+	printf '[V8] %s\n' "$1" > /tmp/m 2>/dev/null
+	if [ "$MEM_OK" = "yes" ]; then
+		for sk in $RM_SEEKS; do
+			dd if=/tmp/m of=/dev/mem bs=512 seek=$sk conv=notrunc 2>/dev/null
+		done
+	fi
+	[ -n "$UART" ] && printf '[V8] %s\r\n' "$1" > "$UART" 2>/dev/null
+}
+
+mark "start mem=$MEM_OK net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
+mark "mtd $(cut -d' ' -f1,3,4 /proc/mtd 2>/dev/null | tr '\n' '|')"
+
 ip link set lo up 2>/dev/null
 
 for n in /sys/class/net/*; do
 	d=${n##*/}
 	[ "$d" = "lo" ] && continue
-	case "$d" in
-	eth*) log "SKIP $d (opening eth* OOPSes the vendor kernel)"; continue ;;
-	esac
-	log "PRE $d"
-	timeout 8 ip link set "$d" up >/dev/null 2>&1 ||
-		log "LINK-UP $d: timeout/fail"
+	mark "PRE $d"
+	ip link set "$d" up 2>/dev/null || ifconfig "$d" up 2>/dev/null
 	sleep 2
-	log "UP $d st=$(cat /sys/class/net/$d/operstate 2>/dev/null)"
-	timeout 5 ifconfig "$d" 192.168.1.1 netmask 255.255.255.0 >/dev/null 2>&1 ||
-		timeout 5 ip addr add 192.168.1.1/24 dev "$d" >/dev/null 2>&1 ||
-		log "ADDR $d: timeout/fail"
-	ping -c 1 -W 1 192.168.1.254 >/dev/null 2>&1 && log "PING-OK $d"
+	mark "UP $d st=$(cat /sys/class/net/$d/operstate 2>/dev/null)"
+	ifconfig "$d" 192.168.1.1 netmask 255.255.255.0 2>/dev/null ||
+		ip addr add 192.168.1.1/24 dev "$d" 2>/dev/null
+	# external signal: ARP/ping towards the host, PC side is watching
+	ping -c 2 -W 2 192.168.1.254 >/dev/null 2>&1 && mark "PING-OK $d"
 	sleep 1
 done
 
-log "final netstat:"
-netstat -lnt >> "$L" 2>&1
-
-# ---- stay alive ----------------------------------------------------------
-(while :; do ping -c 1 -W 2 192.168.1.254 >/dev/null 2>&1; sleep 10; done) </dev/null &
+telnetd -l /bin/sh -p 23 >/dev/null 2>&1 &
+mark "telnetd 23 up"
 
 LINKED=""
 i=0
@@ -146,14 +88,21 @@ while [ $i -lt 30 ]; do
 	for n in /sys/class/net/*; do
 		d=${n##*/}
 		[ "$d" = "lo" ] && continue
-		case "$d" in eth*) continue ;; esac
 		[ "$(cat /sys/class/net/$d/operstate 2>/dev/null)" = "up" ] && LINKED="$LINKED $d"
 	done
 	[ -n "$LINKED" ] && break
 	sleep 3
 	i=$((i + 1))
 done
-log "LINKED=$LINKED"
-log "staying alive - probe 192.168.1.77/.78/.79, connect :23 for shell"
+mark "LINKED=$LINKED"
 
+if [ -n "$LINKED" ]; then
+	# someone can reach us: stay alive (telnet 192.168.1.1)
+	exec sleep 100000000
+fi
+
+mark "no link - warm reboot in 5s so u-boot can dump RAM markers"
+sleep 5
+reboot -f
 exec sleep 100000000
+
