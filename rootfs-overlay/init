@@ -95,11 +95,15 @@ fi
 klog "ubiattach mtd$MTD rc=$rc out=$(tr '\n' ';' < /tmp/ua | head -c 90)"
 
 VOLS=$(ls /sys/class/ubi 2>/dev/null)
-klog "ubi sysfs=[$VOLS]"
+VCNT=$(cat /sys/class/ubi/ubi0/volumes_count 2>/dev/null)
+UBIFS_OK=$(grep -c ubifs /proc/filesystems 2>/dev/null)
+klog "ubi sysfs=[$VOLS] vcnt=$VCNT ubifs-in-kernel=$UBIFS_OK"
 
 UMNT=""
-for v in $(ls /sys/class/ubi/ubi0 2>/dev/null | grep '^ubi0_'); do
-	vn=$(cat /sys/class/ubi/ubi0/$v/name 2>/dev/null)
+# volume dirs live at TOP level: /sys/class/ubi/ubi0_0 etc (v22 bug here)
+for d in $(ls -d /sys/class/ubi/ubi0_* 2>/dev/null); do
+	v=${d##*/}
+	vn=$(cat $d/name 2>/dev/null)
 	if mount -t ubifs "$v" /mnt/a 2>/dev/null; then
 		UMNT="$v($vn)"
 		break
