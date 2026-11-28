@@ -1,25 +1,19 @@
 #!/bin/sh
-# Bring-up init v26 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v27 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v25 board-test results (2026-11-28, ram ring mining):
-#   * UBIFS MOUNTED at /tmp/a: ubiattach mtd9 rc=0 (400 LEBs, 48.4MiB),
-#     volume ubi0_0 name=osgi_ubifs -> mount OK (kernel confirmed).
-#   * volume top holds ONE file: osgi.img  (vendor fs: kos=0 kmi=[]
-#     top=osgi.img). All vendor .kos are packed inside osgi.img, which
-#     the vendor system loop-mounts (kernel strings: "mount loop0").
-#   * kernel log shows "zte open kmodule.img failed!" - vendor boot
-#     mechanism itself looked for kmodule.img and missed it.
-#   * after-insmod net unchanged => ethernet still needs vendor .kos.
+# v26 board-test results (2026-11-28, ram ring mining):
+#   * osgi.img (volume top file) loop-MOUNTED as squashfs on /dev/loop0
+#     -> it is the vendor OSGi MIDDLEWARE tree (bin,bundle,conf,lib,...)
+#     - kos=0, no kmodule.img inside. Ethernet .kos are NOT here.
+#   * kernel "zte open kmodule.img failed!" => vendor kernel loads
+#     /kmoduletmp/kmodule.img from its ROOT fs => vendor rootfs is in
+#     another partition (kernel1 slot tail? plugin_data 65MB UBI?).
 #
-# v26 changes vs v25:
-#   * NEW: loop-mount osgi.img layer (/tmp/b) when volume top has *.img
-#     - try squashfs/cramfs/jffs2/romfs/ext2/ext4/vfat
-#     - ALWAYS log its first magic bytes (hex) so we learn the format
-#       even if every mount fails
-#   * loop device nodes ensured (mknod b 7 N fallback, devtmpfs covers it
-#     when CONFIG_BLK_DEV_LOOP=y)
-#   * re-scan kos/kmi inside /tmp/b; kmodule.img then loop-mounts to
-#     /tmp/kmod as before; insmod paths extended to /tmp/b
+# v27 changes vs v26:
+#   * whole-flash kmodule hunt: dump /proc/mtd map, mknod mtdblock*,
+#     probe EVERY mtdblock with jffs2+squashfs (ro), ubiattach every
+#     mtd + mount every UBIFS volume (/tmp/c), find *.ko / kmodule*.img
+#   * insmod paths extended to /tmp/c
 #   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
@@ -30,8 +24,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V26] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V26] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V27] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V27] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -153,6 +147,53 @@ if [ "$KOS" = "0" ] && [ -n "$OSGI" ]; then
 	klog "osgi layer: kos=$KOS kmi=[$KMI] top=$(ls /tmp/b 2>/dev/null | tr '\n' ',' | head -c 120)"
 fi
 
+# ---------- whole-flash kmodule hunt (v27) ----------
+# v26 board result: osgi.img = squashfs OSGi middleware tree, kos=0,
+# no kmodule.img. The vendor kernel opens /kmoduletmp/kmodule.img on
+# its ROOT fs, so the vendor rootfs (with the .kos) lives in some other
+# partition. Map MTDs, then brute-force probe every partition.
+klog "mtdmap=$(cat /proc/mtd 2>/dev/null | tr '\n' ';' | head -c 240)"
+for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+	[ -e /dev/mtdblock$i ] || mknod /dev/mtdblock$i b 31 $i 2>/dev/null
+done
+mkdir -p /tmp/c
+
+# A) raw jffs2 / squashfs probe on every mtdblock (ro, failures silent)
+HUNT=""
+for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+	grep -q "mtd$i:" /proc/mtd 2>/dev/null || continue
+	for t in jffs2 squashfs; do
+		if mount -o ro -t $t /dev/mtdblock$i /tmp/c 2>/dev/null; then
+			K=$(find /tmp/c -name '*.ko' 2>/dev/null | wc -l)
+			J=$(find /tmp/c -name 'kmodule*.img' 2>/dev/null | head -1)
+			klog "mtd$i $t ok kos=$K kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 100)"
+			if [ "$K" != "0" ]; then KOS=$K; HUNT="mtd$i:$t"; break 2; fi
+			if [ -n "$J" ]; then KMI="$J"; HUNT="mtd$i:$t"; break 2; fi
+			umount /tmp/c 2>/dev/null
+		fi
+	done
+done
+
+# B) UBI probe: attach every mtd, mount every volume, scan (osgi1
+#    already attached as ubi0; duplicates just fail harmlessly)
+for m in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+	grep -q "mtd$m:" /proc/mtd 2>/dev/null || continue
+	ubiattach -m $m /dev/ubi_ctrl >/dev/null 2>&1
+done
+for u in /sys/class/ubi/ubi*_*; do
+	[ -d "$u" ] || continue
+	vol=${u##*/}
+	[ "$vol" = "ubi0_0" ] && continue
+	mount -t ubifs "$vol" /tmp/c 2>/dev/null || continue
+	K=$(find /tmp/c -name '*.ko' 2>/dev/null | wc -l)
+	J=$(find /tmp/c -name 'kmodule*.img' 2>/dev/null | head -1)
+	klog "$vol($(cat $u/name 2>/dev/null)) kos=$K kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 100)"
+	if [ "$K" != "0" ]; then KOS=$K; HUNT="$vol"; break; fi
+	if [ -n "$J" ]; then KMI="$J"; HUNT="$vol"; break; fi
+	umount /tmp/c 2>/dev/null
+done
+klog "hunt done kos=$KOS kmi=[$KMI] src=$HUNT"
+
 # kmodule.img loop-mount fallback if no loose .ko found
 KMNTED=0
 if [ "$KOS" = "0" ] && [ -n "$KMI" ]; then
@@ -173,7 +214,7 @@ fi
 if [ "$KOS" != "0" ]; then
 	for pass in 1 2; do
 		FAILS=""
-		for f in $(find /tmp/a /tmp/b /tmp/kmod -name '*.ko' 2>/dev/null); do
+		for f in $(find /tmp/a /tmp/b /tmp/c /tmp/kmod -name '*.ko' 2>/dev/null); do
 			insmod "$f" 2>/dev/null || FAILS="$FAILS ${f##*/}"
 		done
 	done
