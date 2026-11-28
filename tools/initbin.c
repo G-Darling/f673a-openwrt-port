@@ -79,6 +79,7 @@ static inline long sc5(long n, long a, long b, long c, long d, long e) {
 #define SYS_NANOSLEEP  162
 #define SYS_WAIT4      258
 #define SYS_MKNOD      14
+#define SYS_FINIT_MODULE 379
 
 static long sys_write(int fd, const char *buf, long n) { return sc3(4, fd, (long)buf, n); }
 static long sys_open(const char *p, long fl) { return sc3(SYS_OPEN, (long)p, fl, 0); }
@@ -159,6 +160,56 @@ static int feed_watchdog(void) {
     return -1;
 }
 
+/* ---- v15: finit_module loader - bypass user-space insmod entirely ---- */
+static void load_kmodule(const char *fname) {
+    char path[64];
+    long fd, rc;
+    int i = 0, n = 0;
+    const char *p;
+
+    /* build "/kmodule/<fname>" */
+    p = "/kmodule/";
+    while (*p) path[i++] = *p++;
+    p = fname;
+    while (*p && i < 60) path[i++] = *p++;
+    path[i] = 0;
+
+    fd = sys_open(path, 0);          /* O_RDONLY */
+    if (fd < 0) {
+        klog_add("[INITBIN] KM open fail ");
+        klog_add(fname);
+        klog_add(" rc=");
+        klog_num(fd);
+        klog_flush();
+        return;
+    }
+    n = i;
+    rc = sc3(SYS_FINIT_MODULE, fd, 0, 0);
+    sc1(SYS_CLOSE, fd);
+    klog_add("[INITBIN] KM ");
+    klog_add(fname);
+    klog_add(" finit=");
+    klog_num(rc);
+    klog_flush();
+}
+
+static void load_all_kmodules(void) {
+    /* vendor dependency order; 2 passes for symbol deps */
+    int pass;
+    for (pass = 1; pass <= 2; pass++) {
+        klog_add("[INITBIN] KM pass");
+        klog_num(pass);
+        klog_flush();
+        load_kmodule("patch.ko");
+        load_kmodule("tm_128s.ko");
+        load_kmodule("bspdriver.ko");
+        load_kmodule("switch.ko");
+        load_kmodule("netdriver.ko");
+        load_kmodule("tun.ko");
+        load_kmodule("shellproc.ko");
+    }
+}
+
 /* ---- fork + exec /init ---- */
 static void spawn_init(void) {
     long pid = sc1(SYS_FORK, 0);
@@ -182,7 +233,7 @@ void _start(void) {
     /* 1. mounts: proc (independent of /dev) */
     rc = sys_mount("proc", "/proc", "proc", 0, 0);
     klen = 0;
-    klog_add("[INITBIN] v14 alive mount proc=");
+    klog_add("[INITBIN] v15 alive mount proc=");
     klog_num(rc);
 
     /* 2. writable /dev: tmpfs -> ramfs -> devtmpfs */
@@ -233,7 +284,11 @@ void _start(void) {
         klog_flush();
     }
 
-    /* 6. spawn the bring-up script */
+    /* 6. v15: load vendor kernel modules via finit_module BEFORE /init */
+    klog("[INITBIN] v15 alive - loading /kmodule via finit_module");
+    load_all_kmodules();
+
+    /* 7. spawn the bring-up script */
     spawn_init();
 
     /* 7. PID1 never exits: feed wdt, reap children, respawn /init.
