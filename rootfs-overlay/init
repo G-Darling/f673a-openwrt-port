@@ -1,19 +1,24 @@
 #!/bin/sh
-# Bring-up init v30 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v31 for the ZTE F673AV9a (vendor 4.19.136 kernel, no console).
 #
-# v29 board-test results (2026-11-28, ram ring mining):
-#   * 79 .kos found on mtd0, path /tmp/c/lib/modules/6.12.112/*.ko
-#   * kmod insmod errors: "no module folders for kernel version
-#     4.19.136 found" x4 => running kernel is 4.19.136, modules are
-#     for 6.12.112 => ALL 79 failed both passes, net unchanged.
-#   * v28's "insmod fails" line missing = was actually kmod writing
-#     all those errors; now visible with stderr un-suppressed.
+# THE BIG FINDING (2026-11-28, local rootfs analysis):
+#   * Our OWN rootfs (rf35.tar.gz, flashed to board) already contains
+#     /kmodule/*.ko compiled for the RUNNING kernel 4.19.136:
+#       patch.ko tm_128s.ko bspdriver.ko switch.ko tun.ko
+#       shellproc.ko netdriver.ko      <-- netdriver = ETHERNET!
+#     Verified vermagic=4.19.136 SMP mod_unload ARMv7 p2v8 on all 7.
+#   * All v23-v30 wasted effort hunting vendor partitions (UBI osgi,
+#     osgi.img squashfs, mtd0 jffs2) whose .kos are for kernel 6.12.112
+#     -> vermagic MISMATCH -> every insmod failed. Wrong tree entirely.
+#   * vendor kernel boot log "zte open kmodule.img failed!" = it tries
+#     to load these very drivers from /kmoduletmp/kmodule.img.
 #
-# v30 changes vs v29:
-#   * probe ALL mtdblocks (not just mtd0), log each partition's
-#     lib/modules/<ver> and kos; prefer partition with 4.19.x modules
-#   * re-mount selected partition at /tmp/c before insmod
-#   * HARD RULE unchanged: never write NAND, keep root read-only
+# v31 changes vs v30:
+#   * DROP all UBI/UBIFS/osgi/mtd-block hunting (wrong modules anyway)
+#   * insmod /kmodule/*.ko DIRECTLY from our read-only root, in vendor
+#     dependency order, multiple passes, each result logged separately
+#   * keep: kmsg channel, watchdog feed, network bring-up, dropbear,
+#     liveness loop, HARD RULE (never write NAND, keep root read-only)
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
 export PATH
@@ -23,8 +28,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V30] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V30] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V31] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V31] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -36,12 +41,6 @@ mkdir -p /dev/pts /dev/shm /tmp /var /var/run /var/log /root 2>/dev/null
 mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
-
-# loop devices: devtmpfs provides them if CONFIG_BLK_DEV_LOOP=y;
-# mknod fallback covers the static-node case (b 7 0..3)
-for i in 0 1 2 3; do
-	[ -e /dev/loop$i ] || mknod /dev/loop$i b 7 $i 2>/dev/null
-done
 
 # ---------- watchdog: per-feed single writes ----------
 WDNODE=no
@@ -75,184 +74,42 @@ klog "watchdog probe path=$WDPATH"
 	done
 ) &
 
-mkdir -p /tmp/a /tmp/kmod /tmp/b  # /tmp is tmpfs - / is READ-ONLY jffs2!
+# ---------- THE FIX: load OUR OWN 4.19.136 drivers from /kmodule/ ----------
+RUNV=$(uname -r 2>/dev/null)
+klog "running kernel=$RUNV - loading /kmodule/*.ko (native 4.19 drivers)"
+klog "kmodule dir: $(ls /kmodule 2>/dev/null | tr '\n' ',' )"
 
-# ---------- UBI attach + UBIFS mount (vendor rootfs hunt) ----------
-[ -e /dev/ubi_ctrl ] || mknod /dev/ubi_ctrl c 10 62 2>/dev/null
-[ -e /dev/mtd9 ] || mknod /dev/mtd9 c 90 18 2>/dev/null
-[ -e /dev/mtd10 ] || mknod /dev/mtd10 c 90 20 2>/dev/null
-
-MTD=9
-ubiattach -m 9 /dev/ubi_ctrl > /tmp/ua 2>&1
-rc=$?
-if [ "$rc" != "0" ]; then
-	MTD=10
-	ubiattach -m 10 /dev/ubi_ctrl > /tmp/ua 2>&1
-	rc=$?
-fi
-klog "ubiattach mtd$MTD rc=$rc out=$(tr '\n' ';' < /tmp/ua | head -c 90)"
-
-VOLS=$(ls /sys/class/ubi 2>/dev/null)
-VCNT=$(cat /sys/class/ubi/ubi0/volumes_count 2>/dev/null)
-UBIFS_OK=$(grep -c ubifs /proc/filesystems 2>/dev/null)
-klog "ubi sysfs=[$VOLS] vcnt=$VCNT ubifs-in-kernel=$UBIFS_OK"
-
-UMNT=""
-# volume dirs live at TOP level: /sys/class/ubi/ubi0_0 etc (v22 bug here)
-# NOTE: mount stderr goes to kmsg (no 2>/dev/null) so failure reason lands
-# in the ring - v34 failed blind.
-for d in $(ls -d /sys/class/ubi/ubi0_* 2>/dev/null); do
-	v=${d##*/}
-	vn=$(cat $d/name 2>/dev/null)
-	vtype=$(cat $d/type 2>/dev/null)
-	klog "vol $v name=[$vn] type=$vtype"
-	mount -t ubifs "$v" /tmp/a && UMNT="$v($vn)" && break
-	klog "mount $v rc=$? - trying ro"
-	mount -t ubifs -o ro "$v" /tmp/a && UMNT="$v($vn,ro)" && break
-	if [ -n "$vn" ]; then
-		mount -t ubifs "ubi0:$vn" /tmp/a && UMNT="$v($vn,byname)" && break
-	fi
-done
-klog "ubifs mount=[$UMNT] mntlist=$(grep -E 'ubi|ubifs' /proc/mounts | tr '\n' ';' | head -c 80)"
-
-KOS=0
-KMI=""
-if [ -n "$UMNT" ]; then
-	KMI=$(find /tmp/a -maxdepth 4 -name 'kmodule*.img' 2>/dev/null | head -1)
-	KOS=$(find /tmp/a -name '*.ko' 2>/dev/null | wc -l)
-	klog "vendor fs: kos=$KOS kmi=[$KMI] top=$(ls /tmp/a 2>/dev/null | tr '\n' ',' | head -c 90)"
-fi
-
-# ---------- osgi.img layer (v26) ----------
-# v25 proved the volume top holds one file: osgi.img. The vendor system
-# loop-mounts packed images (kernel string "mount loop0"). Try every
-# plausible fs; log magic bytes FIRST so the format is known even if
-# all mounts fail.
-OSGI=$(ls /tmp/a/*.img 2>/dev/null | head -1)
-OB=0
-if [ "$KOS" = "0" ] && [ -n "$OSGI" ]; then
-	klog "osgi magic=$(dd if="$OSGI" bs=16 count=1 2>/dev/null | od -An -tx1 | tr -s ' \n' ' ')"
-	if mount -o loop -t squashfs "$OSGI" /tmp/b 2>/dev/null; then OB=1
-	elif mount -o loop -t cramfs "$OSGI" /tmp/b 2>/dev/null; then OB=1
-	elif mount -o loop -t jffs2 "$OSGI" /tmp/b 2>/dev/null; then OB=1
-	elif mount -o loop -t romfs "$OSGI" /tmp/b 2>/dev/null; then OB=1
-	elif mount -o loop -t ext2 "$OSGI" /tmp/b 2>/dev/null; then OB=1
-	elif mount -o loop -t ext4 "$OSGI" /tmp/b 2>/dev/null; then OB=1
-	elif mount -o loop -t vfat "$OSGI" /tmp/b 2>/dev/null; then OB=1
-	fi
-	klog "osgi loop rc=$OB mntlist=$(grep -E '/tmp/b' /proc/mounts | tr '\n' ';' | head -c 60)"
-	KMI=$(find /tmp/b -maxdepth 4 -name 'kmodule*.img' 2>/dev/null | head -1)
-	KOS=$(find /tmp/b -name '*.ko' 2>/dev/null | wc -l)
-	klog "osgi layer: kos=$KOS kmi=[$KMI] top=$(ls /tmp/b 2>/dev/null | tr '\n' ',' | head -c 120)"
-fi
-
-# ---------- whole-flash kmodule hunt (v27) ----------
-# v26 board result: osgi.img = squashfs OSGi middleware tree, kos=0,
-# no kmodule.img. The vendor kernel opens /kmoduletmp/kmodule.img on
-# its ROOT fs, so the vendor rootfs (with the .kos) lives in some other
-# partition. Map MTDs, then brute-force probe every partition.
-klog "mtdmap=$(cat /proc/mtd 2>/dev/null | tr '\n' ';' | head -c 240)"
-for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
-	[ -e /dev/mtdblock$i ] || mknod /dev/mtdblock$i b 31 $i 2>/dev/null
-done
-mkdir -p /tmp/c
-
-# A) raw jffs2 / squashfs probe on EVERY mtdblock (ro).
-#    v29 result: mtd0 jffs2 kos=79 BUT all .ko are for kernel 6.12.112
-#    while running kernel is 4.19.136 => every insmod failed.
-#    v30: do NOT stop at the first hit - probe all mtds, record each
-#    partition's lib/modules/<version>, prefer a 4.19 match.
-HUNT=""
-BI=0; BT=""; BV=""; BK=0; RUNV=$(uname -r 2>/dev/null)
-klog "running kernel=$RUNV"
-for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
-	grep -q "mtd$i:" /proc/mtd 2>/dev/null || continue
-	for t in jffs2 squashfs; do
-		if mount -o ro -t $t /dev/mtdblock$i /tmp/c 2>/dev/null; then
-			K=$(find /tmp/c -name '*.ko' 2>/dev/null | wc -l)
-			J=$(find /tmp/c -name 'kmodule*.img' 2>/dev/null | head -1)
-			V=$(ls /tmp/c/lib/modules 2>/dev/null | head -1)
-			klog "mtd$i $t ok kos=$K modver=[$V] kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 60)"
-			if [ "$K" != "0" ]; then
-				case "$V" in
-					"$RUNV"*|4.19*) if [ "$K" -gt "$BK" ]; then BI=$i; BT=$t; BV=$V; BK=$K; fi ;;
-				esac
-				if [ -z "$BT" ]; then BI=$i; BT=$t; BV=$V; BK=$K; fi
-			fi
-			if [ -n "$J" ] && [ -z "$HUNT" ]; then KMI="$J"; HUNT="mtd$i:$t"; fi
-			umount /tmp/c 2>/dev/null
+# vendor dependency order: patch -> tm_128s -> bsp -> switch -> net -> tun -> shellproc
+# run several passes: later passes satisfy deps loaded in earlier ones
+OKLIST=""
+for pass in 1 2 3; do
+	for m in patch tm_128s bspdriver switch netdriver tun shellproc; do
+		f=/kmodule/$m.ko
+		[ -e "$f" ] || continue
+		case " $OKLIST " in
+			*" $m "*) continue ;;   # already loaded OK
+		esac
+		if insmod "$f" 2>/dev/null; then
+			OKLIST="$OKLIST $m"
+			klog "INSMOD OK  $m.ko (pass$pass)"
+		else
+			klog "INSMOD FAIL $m.ko (pass$pass)"
 		fi
 	done
 done
-# mount the BEST partition (highest kos, version match preferred) again
-if [ -n "$BT" ] && mount -o ro -t $BT /dev/mtdblock$BI /tmp/c 2>/dev/null; then
-	KOS=$BK; HUNT="mtd$BI:$BT"; KMI=""
-	klog "selected mtd$BI $BT modver=[$BV] kos=$KOS running=[$RUNV]"
-fi
+klog "loaded=[$OKLIST]"
 
-# B) UBI probe - ONLY if section A found nothing!
-#    v38 board result: A found mtd0 = vendor rootfs jffs2 kos=79 (HIT),
-#    but B's ubiattach over kernel-partition garbage (mtd7+, 32MB)
-#    CRASHED the kernel right after mtd6 "middleware" attach - log ring
-#    ended there, insmod never ran. So: hunt done first, B is skipped.
-if [ -z "$HUNT" ]; then
-	for m in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
-		grep -q "mtd$m:" /proc/mtd 2>/dev/null || continue
-		ubiattach -m $m /dev/ubi_ctrl >/dev/null 2>&1
-	done
-	for u in /sys/class/ubi/ubi*_*; do
-		[ -d "$u" ] || continue
-		vol=${u##*/}
-		[ "$vol" = "ubi0_0" ] && continue
-		mount -t ubifs "$vol" /tmp/c 2>/dev/null || continue
-		K=$(find /tmp/c -name '*.ko' 2>/dev/null | wc -l)
-		J=$(find /tmp/c -name 'kmodule*.img' 2>/dev/null | head -1)
-		klog "$vol($(cat $u/name 2>/dev/null)) kos=$K kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 100)"
-		if [ "$K" != "0" ]; then KOS=$K; HUNT="$vol"; break; fi
-		if [ -n "$J" ]; then KMI="$J"; HUNT="$vol"; break; fi
-		umount /tmp/c 2>/dev/null
-	done
-fi
-klog "hunt done kos=$KOS kmi=[$KMI] src=$HUNT"
-
-# kmodule.img loop-mount fallback if no loose .ko found
-KMNTED=0
-if [ "$KOS" = "0" ] && [ -n "$KMI" ]; then
-	if mount -o loop -t squashfs "$KMI" /tmp/kmod 2>/dev/null; then
-		KMNTED=1
-	elif mount -o loop -t cramfs "$KMI" /tmp/kmod 2>/dev/null; then
-		KMNTED=1
-	elif mount -o loop -t jffs2 "$KMI" /tmp/kmod 2>/dev/null; then
-		KMNTED=1
-	elif mount -o loop -t romfs "$KMI" /tmp/kmod 2>/dev/null; then
-		KMNTED=1
+# also try any other .ko in /kmodule (non-standard extras)
+for f in /kmodule/*.ko; do
+	[ -e "$f" ] || continue
+	m=${f##*/}; m=${m%.ko}
+	case " $OKLIST " in *" $m "*) continue ;; esac
+	if insmod "$f" 2>/dev/null; then
+		OKLIST="$OKLIST $m"; klog "INSMOD OK  $m.ko (extra)"
+	else
+		klog "INSMOD FAIL $m.ko (extra)"
 	fi
-	KOS=$(find /tmp/kmod -name '*.ko' 2>/dev/null | wc -l)
-	klog "kmi loop rc=$KMNTED kos=$KOS"
-fi
-
-# ---------- insmod all vendor modules (two passes for dep order) ----------
-# v39 mystery: hunt done kos=79 but NO insmod fails line, no kernel
-# module errors, nothing between hunt done and after-insmod. v29: full
-# diagnostics + stderr UN-suppressed (script stderr already -> kmsg).
-klog "pre-insmod kos=$KOS c_in_mounts=$(grep -c ' /tmp/c ' /proc/mounts 2>/dev/null) ls_c=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 60)"
-KOLIST=$(find /tmp/a /tmp/b /tmp/c /tmp/kmod -name '*.ko' 2>/dev/null)
-KN=$(echo "$KOLIST" | grep -c . 2>/dev/null)
-klog "kofiles n=$KN head=$(echo "$KOLIST" | head -3 | tr '\n' ',')"
-if [ "$KOS" != "0" ]; then
-	for pass in 1 2; do
-		FAILS=""
-		NF=0
-		for f in $KOLIST; do
-			insmod "$f" || FAILS="$FAILS ${f##*/}"
-			NF=$((NF+1))
-		done
-		klog "pass$pass tried=$NF firstfails=$(echo $FAILS | head -c 60)"
-	done
-	klog "insmod fails=[$FAILS]"
-else
-	klog "SKIP insmod kos=[$KOS]"
-fi
+done
 
 klog "after-insmod net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
 
