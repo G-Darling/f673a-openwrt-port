@@ -31,8 +31,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V23] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V23] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V24] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V24] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -101,15 +101,21 @@ klog "ubi sysfs=[$VOLS] vcnt=$VCNT ubifs-in-kernel=$UBIFS_OK"
 
 UMNT=""
 # volume dirs live at TOP level: /sys/class/ubi/ubi0_0 etc (v22 bug here)
+# NOTE: mount stderr goes to kmsg (no 2>/dev/null) so failure reason lands
+# in the ring - v34 failed blind.
 for d in $(ls -d /sys/class/ubi/ubi0_* 2>/dev/null); do
 	v=${d##*/}
 	vn=$(cat $d/name 2>/dev/null)
-	if mount -t ubifs "$v" /mnt/a 2>/dev/null; then
-		UMNT="$v($vn)"
-		break
+	vtype=$(cat $d/type 2>/dev/null)
+	klog "vol $v name=[$vn] type=$vtype"
+	mount -t ubifs "$v" /mnt/a && UMNT="$v($vn)" && break
+	klog "mount $v rc=$? - trying ro"
+	mount -t ubifs -o ro "$v" /mnt/a && UMNT="$v($vn,ro)" && break
+	if [ -n "$vn" ]; then
+		mount -t ubifs "ubi0:$vn" /mnt/a && UMNT="$v($vn,byname)" && break
 	fi
 done
-klog "ubifs mount=[$UMNT]"
+klog "ubifs mount=[$UMNT] mntlist=$(grep -E 'ubi|ubifs' /proc/mounts | tr '\n' ';' | head -c 80)"
 
 KOS=0
 KMI=""
