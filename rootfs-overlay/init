@@ -1,19 +1,18 @@
 #!/bin/sh
-# Bring-up init v28 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v29 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v27 board-test results (2026-11-28, ram ring mining):
-#   * MTD0 = vendor ROOTFS (jffs2, ro-mounted OK): kos=79! top has
-#     HLTLog.txt,bin,bob_GN25L95_gpon.bin,caldata,cfg,dev,...
-#   * kernel mtd map differs from U-Boot mtdparts! mtd3 "parameter
-#     tags", mtd4 "wlan", mtd5 "usercfg", mtd6 "middleware" (4MB empty).
-#   * CRASH: ubiattach over kernel-partition garbage (mtd7+, 32MB) killed
-#     the kernel right after mtd6 attach - log ring ended there and
-#     insmod never ran.
+# v28 board-test results (2026-11-28, ram ring mining):
+#   * hunt done kos=79 src=mtd0:jffs2 (B skipped correctly)
+#   * BUT between hunt done and after-insmod the ring shows NOTHING -
+#     no insmod fails line, no kernel module errors, net unchanged.
+#     The insmod block apparently never executed its loop body.
 #
-# v28 changes vs v27:
-#   * section B (ubiattach-all) now runs ONLY if section A found nothing
-#   * hunt done is logged immediately after A hit -> insmod of the 79
-#     vendor .kos (two passes) runs before anything risky
+# v29 changes vs v28:
+#   * full insmod diagnostics: pre-insmod state (kos, /tmp/c mount
+#     check, ls), ko file list count + head, per-pass tried-count and
+#     first failures, explicit SKIP log when kos=0
+#   * stderr NO LONGER suppressed on find/insmod: script stderr is
+#     redirected to /dev/kmsg, so every error lands in the ring
 #   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
@@ -24,8 +23,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V28] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V28] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V29] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V29] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -216,14 +215,26 @@ if [ "$KOS" = "0" ] && [ -n "$KMI" ]; then
 fi
 
 # ---------- insmod all vendor modules (two passes for dep order) ----------
+# v39 mystery: hunt done kos=79 but NO insmod fails line, no kernel
+# module errors, nothing between hunt done and after-insmod. v29: full
+# diagnostics + stderr UN-suppressed (script stderr already -> kmsg).
+klog "pre-insmod kos=$KOS c_in_mounts=$(grep -c ' /tmp/c ' /proc/mounts 2>/dev/null) ls_c=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 60)"
+KOLIST=$(find /tmp/a /tmp/b /tmp/c /tmp/kmod -name '*.ko' 2>/dev/null)
+KN=$(echo "$KOLIST" | grep -c . 2>/dev/null)
+klog "kofiles n=$KN head=$(echo "$KOLIST" | head -3 | tr '\n' ',')"
 if [ "$KOS" != "0" ]; then
 	for pass in 1 2; do
 		FAILS=""
-		for f in $(find /tmp/a /tmp/b /tmp/c /tmp/kmod -name '*.ko' 2>/dev/null); do
-			insmod "$f" 2>/dev/null || FAILS="$FAILS ${f##*/}"
+		NF=0
+		for f in $KOLIST; do
+			insmod "$f" || FAILS="$FAILS ${f##*/}"
+			NF=$((NF+1))
 		done
+		klog "pass$pass tried=$NF firstfails=$(echo $FAILS | head -c 60)"
 	done
 	klog "insmod fails=[$FAILS]"
+else
+	klog "SKIP insmod kos=[$KOS]"
 fi
 
 klog "after-insmod net=$(ls /sys/class/net 2>/dev/null | tr '\n' ',')"
