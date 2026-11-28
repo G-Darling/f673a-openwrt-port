@@ -1,26 +1,25 @@
 #!/bin/sh
-# Bring-up init v23 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v26 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v22 board-test results (2026-11-27/28, U-Boot probing + __log_buf mining):
-#   * vendor partitions are NOT jffs2/squashfs - U-Boot md.b shows:
-#     osgi1@0x5a00000 / osgi2@0x8c00000 / plugin_data@0xbe00000 all start
-#     with "UBI#" => vendor rootfs lives in UBI volumes (UBIFS).
-#   * rootfs1/rootfs2 mtd entries OVERLAP kernel1/kernel2 (same offsets
-#     in mtdparts env) - they are aliases, not filesystems. mtd12/13
-#     mount attempts were doomed by design.
-#   * middleware partition is empty (all 0xFF).
-#   * kernel1 holds the intact vendor kernel ("99..44.." hdr + V2.2.0P2N3).
-#   * our root (31:13) = rootfs2 = kernel2 slot; kernel1 is untouched.
-#   * our rootfs HAS the tools (checked in tarball): usr/sbin/ubiattach,
-#     sbin/insmod (kmod), usr/sbin/dropbear+dropbearkey. busybox mount
-#     supports -o loop (FEATURE_MOUNT_LOOP). busybox lacks telnetd.
+# v25 board-test results (2026-11-28, ram ring mining):
+#   * UBIFS MOUNTED at /tmp/a: ubiattach mtd9 rc=0 (400 LEBs, 48.4MiB),
+#     volume ubi0_0 name=osgi_ubifs -> mount OK (kernel confirmed).
+#   * volume top holds ONE file: osgi.img  (vendor fs: kos=0 kmi=[]
+#     top=osgi.img). All vendor .kos are packed inside osgi.img, which
+#     the vendor system loop-mounts (kernel strings: "mount loop0").
+#   * kernel log shows "zte open kmodule.img failed!" - vendor boot
+#     mechanism itself looked for kmodule.img and missed it.
+#   * after-insmod net unchanged => ethernet still needs vendor .kos.
 #
-# v23 changes vs v22:
-#   * ubiattach mtd9 (osgi1, 50MB) -> list volumes via /sys/class/ubi
-#     -> mount -t ubifs ubi0_<n> -> find *.ko + kmodule.img -> insmod all
-#   * fallback: attach mtd10 (osgi2) if mtd9 attach fails / has no volumes
-#   * kmodule.img loop-mount fallback (squashfs/cramfs/jffs2/romfs)
-#   * insmod run twice (deps order); dropbearkey generated before dropbear
+# v26 changes vs v25:
+#   * NEW: loop-mount osgi.img layer (/tmp/b) when volume top has *.img
+#     - try squashfs/cramfs/jffs2/romfs/ext2/ext4/vfat
+#     - ALWAYS log its first magic bytes (hex) so we learn the format
+#       even if every mount fails
+#   * loop device nodes ensured (mknod b 7 N fallback, devtmpfs covers it
+#     when CONFIG_BLK_DEV_LOOP=y)
+#   * re-scan kos/kmi inside /tmp/b; kmodule.img then loop-mounts to
+#     /tmp/kmod as before; insmod paths extended to /tmp/b
 #   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
@@ -31,8 +30,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V25] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V25] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V26] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V26] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -44,6 +43,12 @@ mkdir -p /dev/pts /dev/shm /tmp /var /var/run /var/log /root 2>/dev/null
 mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
+
+# loop devices: devtmpfs provides them if CONFIG_BLK_DEV_LOOP=y;
+# mknod fallback covers the static-node case (b 7 0..3)
+for i in 0 1 2 3; do
+	[ -e /dev/loop$i ] || mknod /dev/loop$i b 7 $i 2>/dev/null
+done
 
 # ---------- watchdog: per-feed single writes ----------
 WDNODE=no
@@ -77,7 +82,7 @@ klog "watchdog probe path=$WDPATH"
 	done
 ) &
 
-mkdir -p /tmp/a /tmp/kmod  # /tmp is tmpfs - / is READ-ONLY jffs2!
+mkdir -p /tmp/a /tmp/kmod /tmp/b  # /tmp is tmpfs - / is READ-ONLY jffs2!
 
 # ---------- UBI attach + UBIFS mount (vendor rootfs hunt) ----------
 [ -e /dev/ubi_ctrl ] || mknod /dev/ubi_ctrl c 10 62 2>/dev/null
@@ -125,6 +130,29 @@ if [ -n "$UMNT" ]; then
 	klog "vendor fs: kos=$KOS kmi=[$KMI] top=$(ls /tmp/a 2>/dev/null | tr '\n' ',' | head -c 90)"
 fi
 
+# ---------- osgi.img layer (v26) ----------
+# v25 proved the volume top holds one file: osgi.img. The vendor system
+# loop-mounts packed images (kernel string "mount loop0"). Try every
+# plausible fs; log magic bytes FIRST so the format is known even if
+# all mounts fail.
+OSGI=$(ls /tmp/a/*.img 2>/dev/null | head -1)
+OB=0
+if [ "$KOS" = "0" ] && [ -n "$OSGI" ]; then
+	klog "osgi magic=$(dd if="$OSGI" bs=16 count=1 2>/dev/null | od -An -tx1 | tr -s ' \n' ' ')"
+	if mount -o loop -t squashfs "$OSGI" /tmp/b 2>/dev/null; then OB=1
+	elif mount -o loop -t cramfs "$OSGI" /tmp/b 2>/dev/null; then OB=1
+	elif mount -o loop -t jffs2 "$OSGI" /tmp/b 2>/dev/null; then OB=1
+	elif mount -o loop -t romfs "$OSGI" /tmp/b 2>/dev/null; then OB=1
+	elif mount -o loop -t ext2 "$OSGI" /tmp/b 2>/dev/null; then OB=1
+	elif mount -o loop -t ext4 "$OSGI" /tmp/b 2>/dev/null; then OB=1
+	elif mount -o loop -t vfat "$OSGI" /tmp/b 2>/dev/null; then OB=1
+	fi
+	klog "osgi loop rc=$OB mntlist=$(grep -E '/tmp/b' /proc/mounts | tr '\n' ';' | head -c 60)"
+	KMI=$(find /tmp/b -maxdepth 4 -name 'kmodule*.img' 2>/dev/null | head -1)
+	KOS=$(find /tmp/b -name '*.ko' 2>/dev/null | wc -l)
+	klog "osgi layer: kos=$KOS kmi=[$KMI] top=$(ls /tmp/b 2>/dev/null | tr '\n' ',' | head -c 120)"
+fi
+
 # kmodule.img loop-mount fallback if no loose .ko found
 KMNTED=0
 if [ "$KOS" = "0" ] && [ -n "$KMI" ]; then
@@ -145,7 +173,7 @@ fi
 if [ "$KOS" != "0" ]; then
 	for pass in 1 2; do
 		FAILS=""
-		for f in $(find /tmp/a /tmp/kmod -name '*.ko' 2>/dev/null); do
+		for f in $(find /tmp/a /tmp/b /tmp/kmod -name '*.ko' 2>/dev/null); do
 			insmod "$f" 2>/dev/null || FAILS="$FAILS ${f##*/}"
 		done
 	done
