@@ -31,8 +31,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V24] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V24] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V25] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V25] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -77,7 +77,7 @@ klog "watchdog probe path=$WDPATH"
 	done
 ) &
 
-mkdir -p /mnt/a /mnt/b /mnt/kmod
+mkdir -p /tmp/a /tmp/kmod  # /tmp is tmpfs - / is READ-ONLY jffs2!
 
 # ---------- UBI attach + UBIFS mount (vendor rootfs hunt) ----------
 [ -e /dev/ubi_ctrl ] || mknod /dev/ubi_ctrl c 10 62 2>/dev/null
@@ -108,11 +108,11 @@ for d in $(ls -d /sys/class/ubi/ubi0_* 2>/dev/null); do
 	vn=$(cat $d/name 2>/dev/null)
 	vtype=$(cat $d/type 2>/dev/null)
 	klog "vol $v name=[$vn] type=$vtype"
-	mount -t ubifs "$v" /mnt/a && UMNT="$v($vn)" && break
+	mount -t ubifs "$v" /tmp/a && UMNT="$v($vn)" && break
 	klog "mount $v rc=$? - trying ro"
-	mount -t ubifs -o ro "$v" /mnt/a && UMNT="$v($vn,ro)" && break
+	mount -t ubifs -o ro "$v" /tmp/a && UMNT="$v($vn,ro)" && break
 	if [ -n "$vn" ]; then
-		mount -t ubifs "ubi0:$vn" /mnt/a && UMNT="$v($vn,byname)" && break
+		mount -t ubifs "ubi0:$vn" /tmp/a && UMNT="$v($vn,byname)" && break
 	fi
 done
 klog "ubifs mount=[$UMNT] mntlist=$(grep -E 'ubi|ubifs' /proc/mounts | tr '\n' ';' | head -c 80)"
@@ -120,24 +120,24 @@ klog "ubifs mount=[$UMNT] mntlist=$(grep -E 'ubi|ubifs' /proc/mounts | tr '\n' '
 KOS=0
 KMI=""
 if [ -n "$UMNT" ]; then
-	KMI=$(find /mnt/a -maxdepth 4 -name 'kmodule*.img' 2>/dev/null | head -1)
-	KOS=$(find /mnt/a -name '*.ko' 2>/dev/null | wc -l)
-	klog "vendor fs: kos=$KOS kmi=[$KMI] top=$(ls /mnt/a 2>/dev/null | tr '\n' ',' | head -c 90)"
+	KMI=$(find /tmp/a -maxdepth 4 -name 'kmodule*.img' 2>/dev/null | head -1)
+	KOS=$(find /tmp/a -name '*.ko' 2>/dev/null | wc -l)
+	klog "vendor fs: kos=$KOS kmi=[$KMI] top=$(ls /tmp/a 2>/dev/null | tr '\n' ',' | head -c 90)"
 fi
 
 # kmodule.img loop-mount fallback if no loose .ko found
 KMNTED=0
 if [ "$KOS" = "0" ] && [ -n "$KMI" ]; then
-	if mount -o loop -t squashfs "$KMI" /mnt/kmod 2>/dev/null; then
+	if mount -o loop -t squashfs "$KMI" /tmp/kmod 2>/dev/null; then
 		KMNTED=1
-	elif mount -o loop -t cramfs "$KMI" /mnt/kmod 2>/dev/null; then
+	elif mount -o loop -t cramfs "$KMI" /tmp/kmod 2>/dev/null; then
 		KMNTED=1
-	elif mount -o loop -t jffs2 "$KMI" /mnt/kmod 2>/dev/null; then
+	elif mount -o loop -t jffs2 "$KMI" /tmp/kmod 2>/dev/null; then
 		KMNTED=1
-	elif mount -o loop -t romfs "$KMI" /mnt/kmod 2>/dev/null; then
+	elif mount -o loop -t romfs "$KMI" /tmp/kmod 2>/dev/null; then
 		KMNTED=1
 	fi
-	KOS=$(find /mnt/kmod -name '*.ko' 2>/dev/null | wc -l)
+	KOS=$(find /tmp/kmod -name '*.ko' 2>/dev/null | wc -l)
 	klog "kmi loop rc=$KMNTED kos=$KOS"
 fi
 
@@ -145,7 +145,7 @@ fi
 if [ "$KOS" != "0" ]; then
 	for pass in 1 2; do
 		FAILS=""
-		for f in $(find /mnt/a /mnt/kmod -name '*.ko' 2>/dev/null); do
+		for f in $(find /tmp/a /tmp/kmod -name '*.ko' 2>/dev/null); do
 			insmod "$f" 2>/dev/null || FAILS="$FAILS ${f##*/}"
 		done
 	done
