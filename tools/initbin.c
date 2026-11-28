@@ -182,7 +182,7 @@ void _start(void) {
     /* 1. mounts: proc (independent of /dev) */
     rc = sys_mount("proc", "/proc", "proc", 0, 0);
     klen = 0;
-    klog_add("[INITBIN] v13 alive mount proc=");
+    klog_add("[INITBIN] v14 alive mount proc=");
     klog_num(rc);
 
     /* 2. writable /dev: tmpfs -> ramfs -> devtmpfs */
