@@ -1,19 +1,19 @@
 #!/bin/sh
-# Bring-up init v27 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v28 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v26 board-test results (2026-11-28, ram ring mining):
-#   * osgi.img (volume top file) loop-MOUNTED as squashfs on /dev/loop0
-#     -> it is the vendor OSGi MIDDLEWARE tree (bin,bundle,conf,lib,...)
-#     - kos=0, no kmodule.img inside. Ethernet .kos are NOT here.
-#   * kernel "zte open kmodule.img failed!" => vendor kernel loads
-#     /kmoduletmp/kmodule.img from its ROOT fs => vendor rootfs is in
-#     another partition (kernel1 slot tail? plugin_data 65MB UBI?).
+# v27 board-test results (2026-11-28, ram ring mining):
+#   * MTD0 = vendor ROOTFS (jffs2, ro-mounted OK): kos=79! top has
+#     HLTLog.txt,bin,bob_GN25L95_gpon.bin,caldata,cfg,dev,...
+#   * kernel mtd map differs from U-Boot mtdparts! mtd3 "parameter
+#     tags", mtd4 "wlan", mtd5 "usercfg", mtd6 "middleware" (4MB empty).
+#   * CRASH: ubiattach over kernel-partition garbage (mtd7+, 32MB) killed
+#     the kernel right after mtd6 attach - log ring ended there and
+#     insmod never ran.
 #
-# v27 changes vs v26:
-#   * whole-flash kmodule hunt: dump /proc/mtd map, mknod mtdblock*,
-#     probe EVERY mtdblock with jffs2+squashfs (ro), ubiattach every
-#     mtd + mount every UBIFS volume (/tmp/c), find *.ko / kmodule*.img
-#   * insmod paths extended to /tmp/c
+# v28 changes vs v27:
+#   * section B (ubiattach-all) now runs ONLY if section A found nothing
+#   * hunt done is logged immediately after A hit -> insmod of the 79
+#     vendor .kos (two passes) runs before anything risky
 #   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
@@ -24,8 +24,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V27] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V27] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V28] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V28] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -174,24 +174,29 @@ for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
 	done
 done
 
-# B) UBI probe: attach every mtd, mount every volume, scan (osgi1
-#    already attached as ubi0; duplicates just fail harmlessly)
-for m in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
-	grep -q "mtd$m:" /proc/mtd 2>/dev/null || continue
-	ubiattach -m $m /dev/ubi_ctrl >/dev/null 2>&1
-done
-for u in /sys/class/ubi/ubi*_*; do
-	[ -d "$u" ] || continue
-	vol=${u##*/}
-	[ "$vol" = "ubi0_0" ] && continue
-	mount -t ubifs "$vol" /tmp/c 2>/dev/null || continue
-	K=$(find /tmp/c -name '*.ko' 2>/dev/null | wc -l)
-	J=$(find /tmp/c -name 'kmodule*.img' 2>/dev/null | head -1)
-	klog "$vol($(cat $u/name 2>/dev/null)) kos=$K kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 100)"
-	if [ "$K" != "0" ]; then KOS=$K; HUNT="$vol"; break; fi
-	if [ -n "$J" ]; then KMI="$J"; HUNT="$vol"; break; fi
-	umount /tmp/c 2>/dev/null
-done
+# B) UBI probe - ONLY if section A found nothing!
+#    v38 board result: A found mtd0 = vendor rootfs jffs2 kos=79 (HIT),
+#    but B's ubiattach over kernel-partition garbage (mtd7+, 32MB)
+#    CRASHED the kernel right after mtd6 "middleware" attach - log ring
+#    ended there, insmod never ran. So: hunt done first, B is skipped.
+if [ -z "$HUNT" ]; then
+	for m in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+		grep -q "mtd$m:" /proc/mtd 2>/dev/null || continue
+		ubiattach -m $m /dev/ubi_ctrl >/dev/null 2>&1
+	done
+	for u in /sys/class/ubi/ubi*_*; do
+		[ -d "$u" ] || continue
+		vol=${u##*/}
+		[ "$vol" = "ubi0_0" ] && continue
+		mount -t ubifs "$vol" /tmp/c 2>/dev/null || continue
+		K=$(find /tmp/c -name '*.ko' 2>/dev/null | wc -l)
+		J=$(find /tmp/c -name 'kmodule*.img' 2>/dev/null | head -1)
+		klog "$vol($(cat $u/name 2>/dev/null)) kos=$K kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 100)"
+		if [ "$K" != "0" ]; then KOS=$K; HUNT="$vol"; break; fi
+		if [ -n "$J" ]; then KMI="$J"; HUNT="$vol"; break; fi
+		umount /tmp/c 2>/dev/null
+	done
+fi
 klog "hunt done kos=$KOS kmi=[$KMI] src=$HUNT"
 
 # kmodule.img loop-mount fallback if no loose .ko found
