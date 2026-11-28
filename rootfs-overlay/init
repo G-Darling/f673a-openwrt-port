@@ -1,18 +1,18 @@
 #!/bin/sh
-# Bring-up init v29 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
+# Bring-up init v30 for the ZTE F673AV9a (vendor 4.19 kernel, no console).
 #
-# v28 board-test results (2026-11-28, ram ring mining):
-#   * hunt done kos=79 src=mtd0:jffs2 (B skipped correctly)
-#   * BUT between hunt done and after-insmod the ring shows NOTHING -
-#     no insmod fails line, no kernel module errors, net unchanged.
-#     The insmod block apparently never executed its loop body.
+# v29 board-test results (2026-11-28, ram ring mining):
+#   * 79 .kos found on mtd0, path /tmp/c/lib/modules/6.12.112/*.ko
+#   * kmod insmod errors: "no module folders for kernel version
+#     4.19.136 found" x4 => running kernel is 4.19.136, modules are
+#     for 6.12.112 => ALL 79 failed both passes, net unchanged.
+#   * v28's "insmod fails" line missing = was actually kmod writing
+#     all those errors; now visible with stderr un-suppressed.
 #
-# v29 changes vs v28:
-#   * full insmod diagnostics: pre-insmod state (kos, /tmp/c mount
-#     check, ls), ko file list count + head, per-pass tried-count and
-#     first failures, explicit SKIP log when kos=0
-#   * stderr NO LONGER suppressed on find/insmod: script stderr is
-#     redirected to /dev/kmsg, so every error lands in the ring
+# v30 changes vs v29:
+#   * probe ALL mtdblocks (not just mtd0), log each partition's
+#     lib/modules/<ver> and kos; prefer partition with 4.19.x modules
+#   * re-mount selected partition at /tmp/c before insmod
 #   * HARD RULE unchanged: never write NAND, keep root read-only
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
@@ -23,8 +23,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V29] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V29] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V30] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V30] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -157,21 +157,38 @@ for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
 done
 mkdir -p /tmp/c
 
-# A) raw jffs2 / squashfs probe on every mtdblock (ro, failures silent)
+# A) raw jffs2 / squashfs probe on EVERY mtdblock (ro).
+#    v29 result: mtd0 jffs2 kos=79 BUT all .ko are for kernel 6.12.112
+#    while running kernel is 4.19.136 => every insmod failed.
+#    v30: do NOT stop at the first hit - probe all mtds, record each
+#    partition's lib/modules/<version>, prefer a 4.19 match.
 HUNT=""
+BI=0; BT=""; BV=""; BK=0; RUNV=$(uname -r 2>/dev/null)
+klog "running kernel=$RUNV"
 for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
 	grep -q "mtd$i:" /proc/mtd 2>/dev/null || continue
 	for t in jffs2 squashfs; do
 		if mount -o ro -t $t /dev/mtdblock$i /tmp/c 2>/dev/null; then
 			K=$(find /tmp/c -name '*.ko' 2>/dev/null | wc -l)
 			J=$(find /tmp/c -name 'kmodule*.img' 2>/dev/null | head -1)
-			klog "mtd$i $t ok kos=$K kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 100)"
-			if [ "$K" != "0" ]; then KOS=$K; HUNT="mtd$i:$t"; break 2; fi
-			if [ -n "$J" ]; then KMI="$J"; HUNT="mtd$i:$t"; break 2; fi
+			V=$(ls /tmp/c/lib/modules 2>/dev/null | head -1)
+			klog "mtd$i $t ok kos=$K modver=[$V] kmi=[$J] top=$(ls /tmp/c 2>/dev/null | tr '\n' ',' | head -c 60)"
+			if [ "$K" != "0" ]; then
+				case "$V" in
+					"$RUNV"*|4.19*) if [ "$K" -gt "$BK" ]; then BI=$i; BT=$t; BV=$V; BK=$K; fi ;;
+				esac
+				if [ -z "$BT" ]; then BI=$i; BT=$t; BV=$V; BK=$K; fi
+			fi
+			if [ -n "$J" ] && [ -z "$HUNT" ]; then KMI="$J"; HUNT="mtd$i:$t"; fi
 			umount /tmp/c 2>/dev/null
 		fi
 	done
 done
+# mount the BEST partition (highest kos, version match preferred) again
+if [ -n "$BT" ] && mount -o ro -t $BT /dev/mtdblock$BI /tmp/c 2>/dev/null; then
+	KOS=$BK; HUNT="mtd$BI:$BT"; KMI=""
+	klog "selected mtd$BI $BT modver=[$BV] kos=$KOS running=[$RUNV]"
+fi
 
 # B) UBI probe - ONLY if section A found nothing!
 #    v38 board result: A found mtd0 = vendor rootfs jffs2 kos=79 (HIT),
