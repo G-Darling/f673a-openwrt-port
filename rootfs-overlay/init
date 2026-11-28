@@ -28,8 +28,8 @@ export PATH
 [ -c /dev/kmsg ] && exec 2>/dev/kmsg
 
 klog() {
-	printf '[V31] %s\n' "$1" > /dev/kmsg 2>/dev/null
-	printf '[V31] %s\n' "$1" > /tmp/v23.log 2>/dev/null
+	printf '[V32] %s\n' "$1" > /dev/kmsg 2>/dev/null
+	printf '[V32] %s\n' "$1" > /tmp/v23.log 2>/dev/null
 	sleep 1
 }
 
@@ -82,6 +82,9 @@ klog "kmodule dir: $(ls /kmodule 2>/dev/null | tr '\n' ',' )"
 # vendor dependency order: patch -> tm_128s -> bsp -> switch -> net -> tun -> shellproc
 # run several passes: later passes satisfy deps loaded in earlier ones
 OKLIST=""
+# insmod tool diagnostics first: which binary, is it executable, ELF?
+klog "insmod path=$(command -v insmod) ls=$(ls -l /sbin/insmod 2>&1 | head -c 80)"
+klog "ko size=$(ls -l /kmodule/patch.ko 2>&1 | head -c 60)"
 for pass in 1 2 3; do
 	for m in patch tm_128s bspdriver switch netdriver tun shellproc; do
 		f=/kmodule/$m.ko
@@ -89,11 +92,12 @@ for pass in 1 2 3; do
 		case " $OKLIST " in
 			*" $m "*) continue ;;   # already loaded OK
 		esac
-		if insmod "$f" 2>/dev/null; then
+		ERR=$(insmod "$f" 2>&1)
+		if [ $? = 0 ]; then
 			OKLIST="$OKLIST $m"
 			klog "INSMOD OK  $m.ko (pass$pass)"
 		else
-			klog "INSMOD FAIL $m.ko (pass$pass)"
+			klog "INSMOD FAIL $m.ko (pass$pass) err=[$ERR]"
 		fi
 	done
 done
@@ -104,10 +108,11 @@ for f in /kmodule/*.ko; do
 	[ -e "$f" ] || continue
 	m=${f##*/}; m=${m%.ko}
 	case " $OKLIST " in *" $m "*) continue ;; esac
-	if insmod "$f" 2>/dev/null; then
+	ERR=$(insmod "$f" 2>&1)
+	if [ $? = 0 ]; then
 		OKLIST="$OKLIST $m"; klog "INSMOD OK  $m.ko (extra)"
 	else
-		klog "INSMOD FAIL $m.ko (extra)"
+		klog "INSMOD FAIL $m.ko (extra) err=[$ERR]"
 	fi
 done
 
